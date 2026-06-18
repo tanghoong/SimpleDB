@@ -227,9 +227,19 @@ class SimpleDBTest extends TestCase
 
     public function testFileAdapterThrowsWhenStorageDirCannotBeCreated(): void
     {
-        $this->expectException(StorageException::class);
+        // Use an existing regular file as the path — FileAdapter must reject it
+        // because it is not a directory (works even when tests run as root).
+        $file = tempnam(sys_get_temp_dir(), 'simpledb_test_');
+        $this->assertNotFalse($file, 'Could not create temporary file for test.');
 
-        new FileAdapter('/root/simpledb_no_permission_' . uniqid());
+        try {
+            $this->expectException(StorageException::class);
+            new FileAdapter($file);
+        } finally {
+            if (file_exists($file)) {
+                unlink($file);
+            }
+        }
     }
 
     public function testListIdsReturnsCorrectIds(): void

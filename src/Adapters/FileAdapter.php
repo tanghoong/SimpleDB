@@ -122,17 +122,41 @@ class FileAdapter implements StorageInterface
 
     public function write(string $collection, string $id, array $data): void
     {
-        $path    = $this->filePath($collection, $id);
-        $dir     = dirname($path);
-        $content = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
-
-        $tmp = tempnam($dir, '.tmp_');
-
-        if ($tmp === false) {
-            throw new StorageException("Cannot create temp file in '{$dir}'.");
-        }
+        $path     = $this->filePath($collection, $id);
+        $dir      = dirname($path);
+        $lockPath = $path . '.lock';
 
         try {
+            $content = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
+        } catch (\JsonException $e) {
+            throw new StorageException(
+                "Failed to encode document '{$id}' to JSON: " . $e->getMessage(),
+                0,
+                $e
+            );
+        }
+
+        // Acquire an exclusive lock on a deterministic per-document lock file so that
+        // concurrent writers are serialised and the lock is held across the rename().
+        $lockHandle = fopen($lockPath, 'c');
+
+        if ($lockHandle === false) {
+            throw new StorageException("Cannot open lock file: {$lockPath}");
+        }
+
+        $tmp = null;
+
+        try {
+            if (!flock($lockHandle, LOCK_EX)) {
+                throw new StorageException("Cannot acquire exclusive lock on: {$lockPath}");
+            }
+
+            $tmp = tempnam($dir, '.tmp_');
+
+            if ($tmp === false) {
+                throw new StorageException("Cannot create temp file in '{$dir}'.");
+            }
+
             $handle = fopen($tmp, 'wb');
 
             if ($handle === false) {
@@ -140,10 +164,6 @@ class FileAdapter implements StorageInterface
             }
 
             try {
-                if (!flock($handle, LOCK_EX)) {
-                    throw new StorageException("Cannot acquire exclusive lock on: {$tmp}");
-                }
-
                 $written = fwrite($handle, $content);
 
                 if ($written === false || $written !== strlen($content)) {
@@ -151,7 +171,6 @@ class FileAdapter implements StorageInterface
                 }
 
                 fflush($handle);
-                flock($handle, LOCK_UN);
             } finally {
                 fclose($handle);
             }
@@ -159,11 +178,16 @@ class FileAdapter implements StorageInterface
             if (!rename($tmp, $path)) {
                 throw new StorageException("Atomic rename failed: {$tmp} -> {$path}");
             }
-        } catch (StorageException $e) {
-            if (file_exists($tmp)) {
+
+            $tmp = null; // rename succeeded; no temp-file cleanup needed
+        } catch (\Throwable $e) {
+            if ($tmp !== null && file_exists($tmp)) {
                 unlink($tmp);
             }
-            throw $e;
+            throw $e instanceof StorageException ? $e : new StorageException($e->getMessage(), 0, $e);
+        } finally {
+            flock($lockHandle, LOCK_UN);
+            fclose($lockHandle);
         }
     }
 
@@ -223,8 +247,19 @@ class FileAdapter implements StorageInterface
             return null;
         }
 
-        $time = filemtime($path);
+        set_error_handler(static fn(): bool => true);
+        try {
+            $time = filemtime($path);
+        } finally {
+            restore_error_handler();
+        }
 
-        return $time !== false ? $time : null;
+        if ($time === false) {
+            throw new StorageException(
+                "Failed to read modification time of document '{$id}' in collection '{$collection}'."
+            );
+        }
+
+        return $time;
     }
 }
