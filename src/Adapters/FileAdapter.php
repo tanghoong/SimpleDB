@@ -11,14 +11,20 @@ class FileAdapter implements StorageInterface
 {
     private readonly string $storageDir;
 
-    public function __construct(string $storageDir)
-    {
+    /**
+     * @param string $storageDir    Writable directory used as the storage root.
+     * @param int    $maxDocumentSize  Maximum allowed JSON byte size per document (default 5 MiB).
+     */
+    public function __construct(
+        string $storageDir,
+        private readonly int $maxDocumentSize = 5 * 1024 * 1024,
+    ) {
         $realDir = realpath($storageDir);
 
         if ($realDir === false) {
             set_error_handler(static fn(): bool => true);
             try {
-                $created = mkdir($storageDir, 0755, true);
+                $created = mkdir($storageDir, 0750, true);
             } finally {
                 restore_error_handler();
             }
@@ -54,6 +60,21 @@ class FileAdapter implements StorageInterface
         return $value;
     }
 
+    /**
+     * Verify that a resolved filesystem path stays within the storage root.
+     * Defends against symlink-based escape attempts.
+     *
+     * @throws StorageException when the path escapes the storage root
+     */
+    private function verifyWithinRoot(string $resolvedPath): void
+    {
+        $prefix = $this->storageDir . DIRECTORY_SEPARATOR;
+
+        if (!str_starts_with($resolvedPath . DIRECTORY_SEPARATOR, $prefix)) {
+            throw new StorageException("Path escapes storage root: {$resolvedPath}");
+        }
+    }
+
     private function collectionPath(string $collection): string
     {
         $safe = $this->sanitise($collection);
@@ -62,7 +83,7 @@ class FileAdapter implements StorageInterface
         if (!is_dir($path)) {
             set_error_handler(static fn(): bool => true);
             try {
-                $created = mkdir($path, 0755, true);
+                $created = mkdir($path, 0750, true);
             } finally {
                 restore_error_handler();
             }
@@ -72,7 +93,15 @@ class FileAdapter implements StorageInterface
             }
         }
 
-        return $path;
+        $resolved = realpath($path);
+
+        if ($resolved === false) {
+            throw new StorageException("Cannot resolve collection directory: {$path}");
+        }
+
+        $this->verifyWithinRoot($resolved);
+
+        return $resolved;
     }
 
     private function filePath(string $collection, string $id): string
@@ -120,6 +149,17 @@ class FileAdapter implements StorageInterface
         return $output;
     }
 
+    /** @return \Generator<string, array> */
+    public function stream(string $collection): \Generator
+    {
+        foreach ($this->listIds($collection) as $id) {
+            $doc = $this->read($collection, $id);
+            if ($doc !== null) {
+                yield $id => $doc;
+            }
+        }
+    }
+
     public function write(string $collection, string $id, array $data): void
     {
         $path     = $this->filePath($collection, $id);
@@ -133,6 +173,12 @@ class FileAdapter implements StorageInterface
                 "Failed to encode document '{$id}' to JSON: " . $e->getMessage(),
                 0,
                 $e
+            );
+        }
+
+        if (strlen($content) > $this->maxDocumentSize) {
+            throw new StorageException(
+                "Document '{$id}' exceeds the maximum allowed size of {$this->maxDocumentSize} bytes."
             );
         }
 
@@ -191,6 +237,14 @@ class FileAdapter implements StorageInterface
         }
     }
 
+    /** @param array<string, array> $documents */
+    public function batchWrite(string $collection, array $documents): void
+    {
+        foreach ($documents as $id => $data) {
+            $this->write($collection, (string) $id, $data);
+        }
+    }
+
     public function delete(string $collection, string $id): void
     {
         $path = $this->filePath($collection, $id);
@@ -233,6 +287,11 @@ class FileAdapter implements StorageInterface
         }
 
         return $ids;
+    }
+
+    public function count(string $collection): int
+    {
+        return count($this->listIds($collection));
     }
 
     public function timestamp(string $collection, string $id): int|null
