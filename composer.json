@@ -10,6 +10,10 @@
         "phpunit/phpunit": "^11.0",
         "phpstan/phpstan": "^1.0"
     },
+    "suggest": {
+        "ext-pdo_sqlite": "Use SqliteAdapter for WAL-mode SQLite storage with native SQL query push-down",
+        "ext-apcu": "Use ApcuCacheAdapter for shared-memory caching across all PHP-FPM workers"
+    },
     "autoload": {
         "psr-4": {
             "SimpleDB\\": "src/"

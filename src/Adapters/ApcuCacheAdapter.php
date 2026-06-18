@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace SimpleDB\Adapters;
 
+use SimpleDB\Contracts\DecoratorInterface;
 use SimpleDB\Contracts\StorageInterface;
 use SimpleDB\Exceptions\StorageException;
 
@@ -18,35 +19,36 @@ use SimpleDB\Exceptions\StorageException;
  * How it works:
  *
  *  read()    → APCu → (miss) → inner adapter → store result in APCu
- *  write()   → inner adapter → update APCu entry
- *  delete()  → inner adapter → remove APCu entry
- *  readAll() → listIds() from inner (one syscall) → read() each doc via APCu
- *  stream()  → delegates to inner (Generators cannot be cached)
+ *  write()   → inner adapter → update APCu entry + invalidate ID-list cache
+ *  delete()  → inner adapter → remove APCu entry + invalidate ID-list cache
+ *  readAll() → listIds() from APCu → read() each doc via APCu
+ *  listIds() → APCu → (miss) → inner adapter → store in APCu
+ *  stream()  → delegates to inner (Generators cannot be cached); warms APCu
  *  count()   → delegates to inner (accurate count required)
  *
  * Cache invalidation:
  *   - Individual document entries are invalidated immediately on write/delete.
- *   - No stale reads within the TTL window for documents touched by this process.
+ *   - The ID-list cache for a collection is invalidated on every write/delete so
+ *     that readAll() / getAll() always returns a fresh set of IDs.
  *   - For multi-process invalidation the TTL should be set to a value your
  *     application can tolerate as a staleness window (e.g. 60 seconds).
  *
- * Usage:
+ * Stacking with NativeQueryInterface adapters:
  *
- *   $file    = new FileAdapter('/path/to/storage');
- *   $cached  = new ApcuCacheAdapter($file, ttl: 60);
- *   $db      = new SimpleDB('cars', $cached);
- *
- * Or on top of SqliteAdapter:
+ *   This adapter implements DecoratorInterface so that QueryBuilder can peek
+ *   through it and find a NativeQueryInterface (e.g. SqliteAdapter) underneath,
+ *   enabling SQL push-down queries even when APCu caching is active.
  *
  *   $sqlite  = new SqliteAdapter('/path/to/store.sqlite');
  *   $cached  = new ApcuCacheAdapter($sqlite, ttl: 30);
  *   $db      = new SimpleDB('sessions', $cached);
+ *   // QueryBuilder automatically uses SQLite native queries for ->where()->get()
  *
  * Requirements:
  *   - The APCu PHP extension must be installed and enabled.
  *   - Works in CLI only when apc.enable_cli = 1 in php.ini.
  */
-class ApcuCacheAdapter implements StorageInterface
+class ApcuCacheAdapter implements StorageInterface, DecoratorInterface
 {
     /**
      * Sentinel stored in APCu to represent "document does not exist",
@@ -70,6 +72,15 @@ class ApcuCacheAdapter implements StorageInterface
                 'APCu is installed but not enabled. Set apc.enabled=1 (and apc.enable_cli=1 for CLI) in php.ini.'
             );
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // DecoratorInterface
+    // -------------------------------------------------------------------------
+
+    public function getInnerAdapter(): StorageInterface
+    {
+        return $this->inner;
     }
 
     // -------------------------------------------------------------------------
@@ -97,7 +108,7 @@ class ApcuCacheAdapter implements StorageInterface
     {
         // Scan the ID list from the underlying store (one syscall / one DB query),
         // then serve each document through the per-document APCu cache.
-        $ids    = $this->inner->listIds($collection);
+        $ids    = $this->listIds($collection);
         $output = [];
 
         foreach ($ids as $id) {
@@ -126,6 +137,8 @@ class ApcuCacheAdapter implements StorageInterface
         $this->inner->write($collection, $id, $data);
         // Keep APCu consistent: update immediately after the inner write succeeds.
         apcu_store($this->docKey($collection, $id), $data, $this->ttl);
+        // Invalidate the cached ID list so the next listIds()/readAll() is fresh.
+        apcu_delete($this->idsKey($collection));
     }
 
     /** @param array<string, array> $documents */
@@ -136,12 +149,15 @@ class ApcuCacheAdapter implements StorageInterface
         foreach ($documents as $id => $data) {
             apcu_store($this->docKey($collection, (string) $id), $data, $this->ttl);
         }
+
+        apcu_delete($this->idsKey($collection));
     }
 
     public function delete(string $collection, string $id): void
     {
         $this->inner->delete($collection, $id);
         apcu_delete($this->docKey($collection, $id));
+        apcu_delete($this->idsKey($collection));
     }
 
     public function exists(string $collection, string $id): bool
@@ -165,7 +181,17 @@ class ApcuCacheAdapter implements StorageInterface
 
     public function listIds(string $collection): array
     {
-        return $this->inner->listIds($collection);
+        $idsKey = $this->idsKey($collection);
+        $ids    = apcu_fetch($idsKey, $found);
+
+        if ($found) {
+            return $ids;
+        }
+
+        $ids = $this->inner->listIds($collection);
+        apcu_store($idsKey, $ids, $this->ttl);
+
+        return $ids;
     }
 
     public function count(string $collection): int
@@ -183,11 +209,25 @@ class ApcuCacheAdapter implements StorageInterface
     // -------------------------------------------------------------------------
 
     /**
-     * Evict all cached entries for a single document.
+     * Evict a single document from the APCu cache.
      */
     public function evict(string $collection, string $id): void
     {
         apcu_delete($this->docKey($collection, $id));
+    }
+
+    /**
+     * Evict all cached entries for an entire collection (documents + ID list).
+     * Requires APCUIterator (available when APCu >= 5.1.0).
+     */
+    public function evictCollection(string $collection): void
+    {
+        if (!class_exists(\APCUIterator::class)) {
+            return;
+        }
+
+        $prefix = preg_quote($this->keyPrefix . $collection . ':', '/');
+        apcu_delete(new \APCUIterator('/^' . $prefix . '/'));
     }
 
     /**
@@ -206,5 +246,10 @@ class ApcuCacheAdapter implements StorageInterface
     private function docKey(string $collection, string $id): string
     {
         return $this->keyPrefix . $collection . ':' . $id;
+    }
+
+    private function idsKey(string $collection): string
+    {
+        return $this->keyPrefix . $collection . ':__ids__';
     }
 }

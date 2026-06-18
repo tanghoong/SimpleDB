@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace SimpleDB\Adapters;
 
+use SimpleDB\Contracts\NativeQueryInterface;
 use SimpleDB\Contracts\StorageInterface;
 use SimpleDB\Exceptions\StorageException;
 
@@ -22,6 +23,8 @@ use SimpleDB\Exceptions\StorageException;
  *  - batchWrite() wraps multiple upserts in a single transaction, reducing
  *    fsync overhead to one commit.
  *  - count() uses SELECT COUNT(*) — O(1) with the index, no document parsing.
+ *  - NativeQueryInterface: QueryBuilder conditions are pushed down to SQL via
+ *    json_extract(), bypassing PHP-side document streaming entirely.
  *
  * Usage:
  *
@@ -32,7 +35,7 @@ use SimpleDB\Exceptions\StorageException;
  *
  *   $adapter = new SqliteAdapter(':memory:');
  */
-class SqliteAdapter implements StorageInterface
+class SqliteAdapter implements StorageInterface, NativeQueryInterface
 {
     private readonly \PDO $pdo;
 
@@ -246,6 +249,107 @@ class SqliteAdapter implements StorageInterface
     }
 
     // -------------------------------------------------------------------------
+    // NativeQueryInterface
+    // -------------------------------------------------------------------------
+
+    /** @return array<string, array> */
+    public function executeNativeQuery(
+        string $collection,
+        array $conditions,
+        array $orders,
+        int $limit,
+        int $offset,
+    ): array {
+        $this->sanitise($collection);
+
+        [$whereClauses, $whereParams] = $this->buildConditionClauses($conditions);
+        [$orderClauses, $orderParams] = $this->buildOrderClauses($orders);
+
+        $sql    = 'SELECT id, data FROM documents WHERE collection = ?';
+        $params = [[$collection, \PDO::PARAM_STR]];
+
+        array_push($params, ...$whereParams);
+
+        if (!empty($whereClauses)) {
+            $sql .= ' AND ' . implode(' AND ', $whereClauses);
+        }
+
+        if (!empty($orderClauses)) {
+            $sql .= ' ORDER BY ' . implode(', ', $orderClauses);
+            array_push($params, ...$orderParams);
+        }
+
+        if ($limit > 0 && $offset > 0) {
+            $sql .= ' LIMIT ? OFFSET ?';
+            $params[] = [$limit,  \PDO::PARAM_INT];
+            $params[] = [$offset, \PDO::PARAM_INT];
+        } elseif ($limit > 0) {
+            $sql .= ' LIMIT ?';
+            $params[] = [$limit, \PDO::PARAM_INT];
+        } elseif ($offset > 0) {
+            $sql .= ' LIMIT -1 OFFSET ?';
+            $params[] = [$offset, \PDO::PARAM_INT];
+        }
+
+        $stmt   = $this->executeTyped($sql, $params);
+        $output = [];
+
+        while ($row = $stmt->fetch()) {
+            $output[$row['id']] = $this->decode($row['data'], $row['id'], $collection);
+        }
+
+        return $output;
+    }
+
+    public function executeNativeFirst(
+        string $collection,
+        array $conditions,
+        array $orders,
+    ): array|null {
+        $results = $this->executeNativeQuery($collection, $conditions, $orders, 1, 0);
+
+        return !empty($results) ? reset($results) : null;
+    }
+
+    public function executeNativeCount(string $collection, array $conditions): int
+    {
+        $this->sanitise($collection);
+
+        [$whereClauses, $whereParams] = $this->buildConditionClauses($conditions);
+
+        $sql    = 'SELECT COUNT(*) FROM documents WHERE collection = ?';
+        $params = [[$collection, \PDO::PARAM_STR]];
+
+        array_push($params, ...$whereParams);
+
+        if (!empty($whereClauses)) {
+            $sql .= ' AND ' . implode(' AND ', $whereClauses);
+        }
+
+        return (int) $this->executeTyped($sql, $params)->fetchColumn();
+    }
+
+    public function executeNativeExists(string $collection, array $conditions): bool
+    {
+        $this->sanitise($collection);
+
+        [$whereClauses, $whereParams] = $this->buildConditionClauses($conditions);
+
+        $sql    = 'SELECT 1 FROM documents WHERE collection = ?';
+        $params = [[$collection, \PDO::PARAM_STR]];
+
+        array_push($params, ...$whereParams);
+
+        if (!empty($whereClauses)) {
+            $sql .= ' AND ' . implode(' AND ', $whereClauses);
+        }
+
+        $sql .= ' LIMIT 1';
+
+        return $this->executeTyped($sql, $params)->fetch() !== false;
+    }
+
+    // -------------------------------------------------------------------------
     // Private helpers
     // -------------------------------------------------------------------------
 
@@ -261,6 +365,8 @@ class SqliteAdapter implements StorageInterface
         $this->pdo->exec('PRAGMA temp_store = MEMORY');
         // Wait up to 5 s when another writer holds the lock.
         $this->pdo->exec('PRAGMA busy_timeout = 5000');
+        // Case-sensitive LIKE to match PHP's str_contains/str_starts_with/str_ends_with.
+        $this->pdo->exec('PRAGMA case_sensitive_like = ON');
     }
 
     private function createSchema(): void
@@ -303,5 +409,286 @@ class SqliteAdapter implements StorageInterface
         }
 
         return $data;
+    }
+
+    /**
+     * Prepare and execute a statement, binding each parameter with an explicit PDO type.
+     *
+     * PDO's execute($array) binds every value as PARAM_STR.  SQLite's json_extract()
+     * returns natively typed values (INTEGER, REAL, TEXT), so a TEXT-bound PHP integer
+     * would cause type-affinity mismatches (e.g. INTEGER < TEXT is always true in
+     * SQLite, regardless of numeric value).  Explicit bindValue() calls preserve types.
+     *
+     * @param list<array{0: mixed, 1: int}> $typedParams  Each element: [value, PDO::PARAM_*]
+     */
+    private function executeTyped(string $sql, array $typedParams): \PDOStatement
+    {
+        $stmt = $this->pdo->prepare($sql);
+
+        foreach ($typedParams as $i => [$value, $type]) {
+            $stmt->bindValue($i + 1, $value, $type);
+        }
+
+        $stmt->execute();
+
+        return $stmt;
+    }
+
+    /**
+     * Convert a dot-notation field name to a SQLite json_extract path.
+     * Numeric segments become array indices: 'items.0.name' → '$.items[0].name'
+     */
+    private function toJsonPath(string $field): string
+    {
+        $parts = explode('.', $field);
+        $path  = '$';
+
+        foreach ($parts as $part) {
+            $path .= ctype_digit($part) ? '[' . $part . ']' : '.' . $part;
+        }
+
+        return $path;
+    }
+
+    /**
+     * Escape special LIKE characters using '!' as the escape character.
+     */
+    private function escapeLike(string $value): string
+    {
+        return str_replace(['!', '%', '_'], ['!!', '!%', '!_'], $value);
+    }
+
+    /**
+     * Return [sql_fragment, typed_param] for a scalar comparison value.
+     *
+     * Integers → PARAM_INT (SQLite INTEGER comparison).
+     * Floats   → CAST(? AS REAL) with PARAM_STR (no PDO::PARAM_FLOAT exists).
+     * Strings  → PARAM_STR.
+     * Bools    → PARAM_INT cast to 0/1.
+     *
+     * @return array{0: string, 1: array{0: mixed, 1: int}}
+     */
+    private function sqlValueFragment(mixed $value): array
+    {
+        if (is_bool($value)) {
+            return ['?', [(int) $value, \PDO::PARAM_INT]];
+        }
+
+        if (is_int($value)) {
+            return ['?', [$value, \PDO::PARAM_INT]];
+        }
+
+        if (is_float($value)) {
+            // No PDO::PARAM_FLOAT — bind as string and cast in SQL so SQLite sees REAL.
+            return ['CAST(? AS REAL)', [(string) $value, \PDO::PARAM_STR]];
+        }
+
+        return ['?', [(string) $value, \PDO::PARAM_STR]];
+    }
+
+    /**
+     * Build the WHERE fragment and typed positional param list for a set of conditions.
+     *
+     * @param  list<array{field: string, operator: string, value: mixed}> $conditions
+     * @return array{list<string>, list<array{0: mixed, 1: int}>}
+     */
+    private function buildConditionClauses(array $conditions): array
+    {
+        $clauses = [];
+        $params  = [];
+
+        foreach ($conditions as ['field' => $field, 'operator' => $op, 'value' => $expected]) {
+            $path = $this->toJsonPath($field);
+            [$clause, $clauseParams] = $this->buildConditionClause($path, $op, $expected);
+            $clauses[] = $clause;
+            array_push($params, ...$clauseParams);
+        }
+
+        return [$clauses, $params];
+    }
+
+    /**
+     * Build a single SQL condition fragment and its typed bound parameters.
+     *
+     * @return array{string, list<array{0: mixed, 1: int}>}
+     */
+    private function buildConditionClause(string $path, string $op, mixed $expected): array
+    {
+        $pathParam = [$path, \PDO::PARAM_STR];
+        $ex        = 'json_extract(data, ?)';
+
+        switch ($op) {
+            case '=':
+                if ($expected === null) {
+                    return ["{$ex} IS NULL", [$pathParam]];
+                }
+                [$frag, $valParam] = $this->sqlValueFragment($expected);
+                return ["{$ex} = {$frag}", [$pathParam, $valParam]];
+
+            case '!=':
+                if ($expected === null) {
+                    return ["{$ex} IS NOT NULL", [$pathParam]];
+                }
+                [$frag, $valParam] = $this->sqlValueFragment($expected);
+                // Rows where the field is null/missing should also be included (null != anything)
+                return ["({$ex} IS NULL OR {$ex} != {$frag})", [$pathParam, $pathParam, $valParam]];
+
+            case '>':
+                [$frag, $valParam] = $this->sqlValueFragment($expected);
+                return ["{$ex} > {$frag}", [$pathParam, $valParam]];
+
+            case '>=':
+                [$frag, $valParam] = $this->sqlValueFragment($expected);
+                return ["{$ex} >= {$frag}", [$pathParam, $valParam]];
+
+            case '<':
+                [$frag, $valParam] = $this->sqlValueFragment($expected);
+                return ["{$ex} < {$frag}", [$pathParam, $valParam]];
+
+            case '<=':
+                [$frag, $valParam] = $this->sqlValueFragment($expected);
+                return ["{$ex} <= {$frag}", [$pathParam, $valParam]];
+
+            case 'in':
+                return $this->buildInClause($path, (array) $expected, negate: false);
+
+            case 'not_in':
+                return $this->buildInClause($path, (array) $expected, negate: true);
+
+            case 'contains':
+                $pattern = '%' . $this->escapeLike((string) $expected) . '%';
+                return [
+                    "(typeof({$ex}) = 'text' AND {$ex} LIKE ? ESCAPE '!')",
+                    [$pathParam, $pathParam, [$pattern, \PDO::PARAM_STR]],
+                ];
+
+            case 'starts_with':
+                $pattern = $this->escapeLike((string) $expected) . '%';
+                return [
+                    "(typeof({$ex}) = 'text' AND {$ex} LIKE ? ESCAPE '!')",
+                    [$pathParam, $pathParam, [$pattern, \PDO::PARAM_STR]],
+                ];
+
+            case 'ends_with':
+                $pattern = '%' . $this->escapeLike((string) $expected);
+                return [
+                    "(typeof({$ex}) = 'text' AND {$ex} LIKE ? ESCAPE '!')",
+                    [$pathParam, $pathParam, [$pattern, \PDO::PARAM_STR]],
+                ];
+
+            case 'null':
+                return ["{$ex} IS NULL", [$pathParam]];
+
+            case 'not_null':
+                return ["{$ex} IS NOT NULL", [$pathParam]];
+
+            default:
+                throw new StorageException("Unsupported native operator: {$op}");
+        }
+    }
+
+    /**
+     * Build an IN / NOT IN clause, handling empty lists and null values correctly.
+     *
+     * @param  list<mixed>  $expected
+     * @return array{string, list<array{0: mixed, 1: int}>}
+     */
+    private function buildInClause(string $path, array $expected, bool $negate): array
+    {
+        $pathParam = [$path, \PDO::PARAM_STR];
+        $ex        = 'json_extract(data, ?)';
+
+        if (!$negate) {
+            if (empty($expected)) {
+                return ['(0=1)', []];
+            }
+
+            $nulls    = array_values(array_filter($expected, fn($v) => $v === null));
+            $nonNulls = array_values(array_filter($expected, fn($v) => $v !== null));
+
+            if (!empty($nulls) && !empty($nonNulls)) {
+                [$frags, $valParams] = $this->inValueFragments($nonNulls);
+                $ph = implode(',', $frags);
+                return [
+                    "({$ex} IS NULL OR {$ex} IN ({$ph}))",
+                    [$pathParam, $pathParam, ...$valParams],
+                ];
+            }
+
+            if (!empty($nulls)) {
+                return ["{$ex} IS NULL", [$pathParam]];
+            }
+
+            [$frags, $valParams] = $this->inValueFragments($nonNulls);
+            $ph = implode(',', $frags);
+            return ["{$ex} IN ({$ph})", [$pathParam, ...$valParams]];
+        }
+
+        // not_in: PHP → !in_array($actual, $expected, strict: true)  (no $fieldExists guard)
+        if (empty($expected)) {
+            return ['(1=1)', []];
+        }
+
+        $nulls    = array_values(array_filter($expected, fn($v) => $v === null));
+        $nonNulls = array_values(array_filter($expected, fn($v) => $v !== null));
+
+        if (!empty($nulls) && !empty($nonNulls)) {
+            [$frags, $valParams] = $this->inValueFragments($nonNulls);
+            $ph = implode(',', $frags);
+            return [
+                "({$ex} IS NOT NULL AND {$ex} NOT IN ({$ph}))",
+                [$pathParam, $pathParam, ...$valParams],
+            ];
+        }
+
+        if (!empty($nulls)) {
+            return ["{$ex} IS NOT NULL", [$pathParam]];
+        }
+
+        [$frags, $valParams] = $this->inValueFragments($nonNulls);
+        $ph = implode(',', $frags);
+        return [
+            "({$ex} IS NULL OR {$ex} NOT IN ({$ph}))",
+            [$pathParam, $pathParam, ...$valParams],
+        ];
+    }
+
+    /**
+     * Build SQL fragments and typed params for a list of IN/NOT IN values.
+     *
+     * @param  list<mixed>  $values  Non-null values only.
+     * @return array{list<string>, list<array{0: mixed, 1: int}>}
+     */
+    private function inValueFragments(array $values): array
+    {
+        $frags     = [];
+        $params    = [];
+
+        foreach ($values as $value) {
+            [$frag, $param] = $this->sqlValueFragment($value);
+            $frags[]  = $frag;
+            $params[] = $param;
+        }
+
+        return [$frags, $params];
+    }
+
+    /**
+     * Build ORDER BY fragments and their typed bound parameters.
+     *
+     * @param  list<array{field: string, direction: string}>   $orders
+     * @return array{list<string>, list<array{0: mixed, 1: int}>}
+     */
+    private function buildOrderClauses(array $orders): array
+    {
+        $clauses = [];
+        $params  = [];
+
+        foreach ($orders as ['field' => $field, 'direction' => $dir]) {
+            $clauses[] = 'json_extract(data, ?) ' . strtoupper($dir);
+            $params[]  = [$this->toJsonPath($field), \PDO::PARAM_STR];
+        }
+
+        return [$clauses, $params];
     }
 }

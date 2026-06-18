@@ -23,6 +23,10 @@ composer require tanghoong/simpledb
 
 **Requirements:** PHP ≥ 8.2
 
+Optional extensions (suggested in `composer.json`):
+- `ext-pdo_sqlite` — for `SqliteAdapter` (ships with PHP; verify with `php -m | grep pdo_sqlite`)
+- `ext-apcu` — for `ApcuCacheAdapter` (`pecl install apcu`; set `apc.enable_cli=1` for CLI)
+
 ---
 
 ## Quick Start
@@ -73,6 +77,7 @@ Stores every collection in a single SQLite database file using PHP's built-in `p
 - **`count()` is a cheap `SELECT COUNT(*)`** — no document parsing.
 - **64 MB in-memory page cache** keeps hot pages in RAM.
 - **5-second busy timeout** instead of immediate `SQLITE_BUSY` failure under contention.
+- **Native query push-down** — QueryBuilder conditions are translated to SQL via `json_extract()`, bypassing PHP-level streaming entirely (see below).
 
 ```php
 use SimpleDB\Adapters\SqliteAdapter;
@@ -97,6 +102,33 @@ $trucks = new SimpleDB('trucks', $adapter);
 ```
 
 **Requirement:** `ext-pdo_sqlite` (ships with PHP; verify with `php -m | grep pdo_sqlite`).
+
+#### Native Query Push-Down
+
+`SqliteAdapter` implements `NativeQueryInterface`.  When the QueryBuilder detects this, it generates and executes a single SQL statement instead of streaming every document through PHP:
+
+```php
+// This translates to a single SQL query:
+//   SELECT id, data FROM documents
+//    WHERE collection = ?
+//      AND json_extract(data, '$.type') = ?
+//      AND json_extract(data, '$.price') < ?
+//    ORDER BY json_extract(data, '$.name') ASC
+//    LIMIT 10
+$results = $db->where('type', 'sedan')
+              ->where('price', '<', 28000)
+              ->orderBy('name')
+              ->limit(10)
+              ->get();
+```
+
+All 13 QueryBuilder operators are supported natively, including `contains` / `starts_with` / `ends_with` (case-sensitive LIKE), `in` / `not_in`, and `null` / `not_null`. Dot-notation nested fields map to `json_extract` paths:
+
+| PHP field notation | SQL json_extract path |
+|---|---|
+| `'name'` | `$.name` |
+| `'address.city'` | `$.address.city` |
+| `'items.0.sku'` | `$.items[0].sku` |
 
 ---
 
@@ -126,22 +158,47 @@ $db = new SimpleDB('sessions', new ApcuCacheAdapter(new SqliteAdapter('/path/to/
 
 | Operation | Cache behaviour |
 |-----------|----------------|
-| `read()`  | APCu hit → return immediately; miss → read inner, store in APCu |
-| `write()` | Write to inner, then update APCu entry |
-| `delete()` | Delete from inner, then evict APCu entry |
-| `readAll()` | `listIds()` from inner (one syscall), then serve each doc via APCu |
-| `stream()` | Delegate to inner, warm APCu as each doc passes through |
+| `read()` | APCu hit → return immediately; miss → read inner, store in APCu |
+| `write()` | Write to inner, update APCu entry, invalidate ID-list cache |
+| `delete()` | Delete from inner, evict APCu entry, invalidate ID-list cache |
+| `readAll()` | `listIds()` from APCu (or inner on miss), then serve each doc via per-doc cache |
+| `listIds()` | APCu hit → return cached list; miss → query inner, store in APCu |
+| `stream()` | Delegate to inner; warm APCu as each doc passes through |
 | `count()` | Delegate to inner (accurate count required) |
 
 Missing documents are stored as a tombstone to prevent repeated storage lookups for non-existent keys.
 
 ```php
-// Manual eviction
+// Manual eviction of a single document
 $cached->evict('cars', $id);
+
+// Evict all cached entries for a collection (documents + ID list)
+$cached->evictCollection('cars');
 
 // Flush all APCu keys (affects the whole PHP process, use carefully)
 $cached->flushAll();
 ```
+
+#### Native query push-down through the cache layer
+
+`ApcuCacheAdapter` implements `DecoratorInterface`.  QueryBuilder automatically peeks through decorator layers to find a `NativeQueryInterface` adapter underneath.  This means SQL push-down works transparently even when APCu caching is active:
+
+```php
+// ApcuCacheAdapter wrapping SqliteAdapter:
+// QueryBuilder → peeks through ApcuCacheAdapter → finds SqliteAdapter (NativeQueryInterface)
+// → executes a single SQL query instead of PHP streaming
+$db = new SimpleDB(
+    'products',
+    new ApcuCacheAdapter(new SqliteAdapter('/var/data/myapp.sqlite'), ttl: 60),
+);
+
+$results = $db->where('category', 'electronics')
+              ->where('price', '<', 500)
+              ->orderBy('name')
+              ->get(); // runs as SQL, not PHP streaming
+```
+
+Individual document reads from `get()` / `getAll()` still go through the APCu cache as usual.
 
 **Requirements:** `ext-apcu` (`pecl install apcu`); for CLI set `apc.enable_cli=1` in `php.ini`.
 
@@ -172,6 +229,8 @@ public function __construct(
 ### Fluent Query Builder
 
 The most expressive way to query.  Start with `->where()` or `->newQuery()`, chain conditions, terminate with `->get()`, `->first()`, `->count()`, or `->exists()`.
+
+When the underlying adapter (or the adapter it wraps) implements `NativeQueryInterface`, **all terminal methods execute as a single database query** instead of streaming documents through PHP.
 
 ```php
 // Equality shorthand
@@ -210,9 +269,9 @@ if ($db->where('sku', 'ABC-001')->exists()) { ... }
 | `<=`           | field value is less than or equal to              |
 | `in`           | field value appears in the given array            |
 | `not_in`       | field value does not appear in the given array    |
-| `contains`     | field string contains the substring               |
-| `starts_with`  | field string starts with the prefix               |
-| `ends_with`    | field string ends with the suffix                 |
+| `contains`     | field string contains the substring (case-sensitive) |
+| `starts_with`  | field string starts with the prefix (case-sensitive) |
+| `ends_with`    | field string ends with the suffix (case-sensitive)   |
 | `null`         | field is missing or set to `null`                 |
 | `not_null`     | field exists and is not `null`                    |
 
@@ -231,6 +290,10 @@ $db->newQuery()->whereNotNull('email')->get();
 // Document: {'address': {'city': 'Paris', 'zip': '75001'}}
 $results = $db->where('address.city', 'Paris')->get();
 $results = $db->where('address.zip', 'starts_with', '75')->get();
+
+// Array index access
+// Document: {'tags': ['php', 'sqlite', 'nosql']}
+$results = $db->where('tags.0', 'php')->get();
 ```
 
 ---
@@ -421,7 +484,7 @@ Checks in-process cache first, then falls back to storage.
 #### `clearCache(): void`
 
 ```php
-$db->clearCache();  // force next get() to re-read from disk
+$db->clearCache();  // force next get() to re-read from disk/DB
 ```
 
 ---
@@ -488,18 +551,23 @@ foreach ($db as $id => $document) {
 
 ### Custom Storage Adapter
 
-Any class implementing `StorageInterface` can replace `FileAdapter`:
+Any class implementing `StorageInterface` can replace `FileAdapter`.  Optionally implement `NativeQueryInterface` to push query conditions into the storage engine, and `DecoratorInterface` if your adapter wraps another:
 
 ```php
 use SimpleDB\Contracts\StorageInterface;
+use SimpleDB\Contracts\NativeQueryInterface;
 
-class RedisAdapter implements StorageInterface
+class RedisAdapter implements StorageInterface, NativeQueryInterface
 {
-    // read, readAll, stream, write, batchWrite,
-    // delete, exists, listIds, count, timestamp
+    // StorageInterface: read, readAll, stream, write, batchWrite,
+    //                   delete, exists, listIds, count, timestamp
+    //
+    // NativeQueryInterface: executeNativeQuery, executeNativeFirst,
+    //                       executeNativeCount, executeNativeExists
 }
 
 $db = new SimpleDB('sessions', new RedisAdapter($redis));
+// QueryBuilder automatically uses native queries via RedisAdapter
 ```
 
 ---
@@ -524,11 +592,17 @@ $db = new SimpleDB('sessions', new RedisAdapter($redis));
 | Feature                      | Details                                                                                          |
 |------------------------------|--------------------------------------------------------------------------------------------------|
 | **In-process cache**         | `get()` / `exists()` serve from a per-instance cache after the first read; invalidated on write/delete |
+| **APCu shared-memory cache** | `ApcuCacheAdapter` shares cached documents and ID lists across all PHP-FPM workers               |
+| **APCu ID-list cache**       | `listIds()` result per collection is cached in APCu; invalidated immediately on write/delete    |
+| **Tombstone cache**          | Missing-document lookups are cached so repeated `get('ghost-id')` skips storage entirely         |
+| **SQL push-down queries**    | `SqliteAdapter` implements `NativeQueryInterface`; all QueryBuilder conditions run as SQL         |
+| **Decorator peek-through**   | QueryBuilder peels through `ApcuCacheAdapter` layers to find `SqliteAdapter` for SQL push-down  |
 | **Streaming reads**          | `stream()` / `foreach ($db ...)` yield documents lazily via Generator                            |
 | **Batch operations**         | `batchPost()` / `batchPut()` reduce per-operation overhead                                       |
-| **Cheap counts**             | `count()` reads only filenames — no document parsing                                             |
-| **Lazy query filtering**     | QueryBuilder streams and evaluates conditions one document at a time; breaks early when possible  |
-| **Pagination**               | `query(limit:, offset:)` and `->limit()->offset()` on the builder                               |
+| **SQLite WAL + page cache**  | Concurrent readers, 64 MB page cache, single-transaction batch writes                            |
+| **Cheap counts**             | `count()` uses `SELECT COUNT(*)` (SQLite) or reads only filenames (FileAdapter) — no document parsing |
+| **Lazy query filtering**     | Without NativeQueryInterface, QueryBuilder streams one document at a time and breaks early        |
+| **Pagination**               | `query(limit:, offset:)` and `->limit()->offset()` on the builder (SQL `LIMIT/OFFSET` for SQLite) |
 
 ---
 
@@ -536,7 +610,7 @@ $db = new SimpleDB('sessions', new RedisAdapter($redis));
 
 | Exception                    | When thrown                                                      |
 |------------------------------|------------------------------------------------------------------|
-| `StorageException`           | I/O error, invalid ID/collection name, document too large, path escapes root |
+| `StorageException`           | I/O error, invalid ID/collection name, document too large, path escapes root, APCu not available |
 | `DocumentNotFoundException`  | `delete()` called with an ID that does not exist                 |
 
 Both extend `SimpleDB\Exceptions\SimpleDBException`.
@@ -547,7 +621,7 @@ Both extend `SimpleDB\Exceptions\SimpleDBException`.
 
 ```bash
 composer install
-vendor/bin/phpunit          # 105 tests
+vendor/bin/phpunit          # 172 tests (14 skipped when APCu not installed)
 ```
 
 Static analysis:
@@ -565,13 +639,15 @@ SimpleDB/
 ├── src/
 │   ├── SimpleDB.php                     # Main class
 │   ├── Contracts/
-│   │   └── StorageInterface.php         # Storage adapter contract
+│   │   ├── StorageInterface.php         # Storage adapter contract
+│   │   ├── NativeQueryInterface.php     # SQL/native query push-down contract
+│   │   └── DecoratorInterface.php       # Decorator peek-through contract
 │   ├── Adapters/
 │   │   ├── FileAdapter.php              # One JSON file per document
-│   │   ├── SqliteAdapter.php            # SQLite-backed (WAL, transactions)
-│   │   └── ApcuCacheAdapter.php         # APCu shared-memory cache decorator
+│   │   ├── SqliteAdapter.php            # SQLite (WAL, transactions, NativeQueryInterface)
+│   │   └── ApcuCacheAdapter.php         # APCu cache decorator (DecoratorInterface)
 │   ├── Query/
-│   │   └── QueryBuilder.php             # Fluent query builder
+│   │   └── QueryBuilder.php             # Fluent query builder (auto-detects NativeQueryInterface)
 │   └── Exceptions/
 │       ├── SimpleDBException.php        # Base exception
 │       ├── DocumentNotFoundException.php
@@ -581,6 +657,7 @@ SimpleDB/
 │   ├── QueryBuilderTest.php             # Fluent query builder (33)
 │   ├── SimpleDBFeaturesTest.php         # Interfaces / hooks / timestamps (28)
 │   ├── SqliteAdapterTest.php            # SqliteAdapter full coverage (23)
+│   ├── NativeQueryTest.php              # SQL push-down via NativeQueryInterface (30)
 │   └── ApcuCacheAdapterTest.php         # ApcuCacheAdapter (skipped if APCu absent)
 ├── composer.json
 ├── phpunit.xml
@@ -597,40 +674,3 @@ SimpleDB/
 | `$db->get($id)`                          | `$db->get($id)` (returns `null` not `false`) |
 | `$db->get()`                             | `$db->getAll()`                            |
 | `$db->post($array)`                      | `$db->post($array)`                        |
-| `$db->put($id, $array)`                  | `$db->put($id, $array)`                    |
-| `$db->delete($id)`                       | `$db->delete($id)` (throws on missing)     |
-| `$db->query('color=blue&make=Honda')`    | `$db->where('color','blue')->where('make','Honda')->get()` |
-| `$db->timestamp($id)`                    | `$db->timestamp($id)` (returns `null` not `false`) |
-
-### Migrating Custom Storage Adapters (v2 → v3)
-
-`StorageInterface` gained three new methods — add these to any custom adapter:
-
-```php
-public function stream(string $collection): \Generator { ... }
-public function batchWrite(string $collection, array $documents): void { ... }
-public function count(string $collection): int { ... }
-```
-
----
-
-## Requirements
-
-- PHP ≥ 8.2
-- A writable filesystem directory for storage
-
----
-
-## License
-
-MIT © [Simplicity Solutions Group](http://simplicitysolutionsgroup.com)
-
----
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/my-feature`)
-3. Write tests for your changes
-4. Ensure all tests pass (`vendor/bin/phpunit`)
-5. Open a pull request

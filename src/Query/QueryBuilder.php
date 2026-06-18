@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace SimpleDB\Query;
 
+use SimpleDB\Contracts\DecoratorInterface;
+use SimpleDB\Contracts\NativeQueryInterface;
 use SimpleDB\Contracts\StorageInterface;
 
 /**
@@ -15,6 +17,12 @@ use SimpleDB\Contracts\StorageInterface;
  * orderBy() is used (which requires a full pass for sorting).
  *
  * All constraint methods return $this so they are chainable.
+ *
+ * Native query push-down:
+ *   When the underlying StorageAdapter implements NativeQueryInterface (e.g.
+ *   SqliteAdapter), query conditions are pushed down to SQL — no PHP-level
+ *   streaming occurs.  DecoratorInterface layers (e.g. ApcuCacheAdapter) are
+ *   peeled back automatically so the native adapter is always found.
  */
 final class QueryBuilder
 {
@@ -30,11 +38,15 @@ final class QueryBuilder
     /** Sentinel returned by resolveField() when a path does not exist in the document. */
     private readonly object $missing;
 
+    /** Non-null when the storage (or a decorated inner adapter) supports native queries. */
+    private readonly NativeQueryInterface|null $native;
+
     public function __construct(
         private readonly string $collection,
         private readonly StorageInterface $storage,
     ) {
         $this->missing = new \stdClass();
+        $this->native  = $this->resolveNativeStorage($storage);
     }
 
     // -------------------------------------------------------------------------
@@ -142,6 +154,16 @@ final class QueryBuilder
      */
     public function get(): array
     {
+        if ($this->native !== null) {
+            return $this->native->executeNativeQuery(
+                $this->collection,
+                $this->conditions,
+                $this->orders,
+                $this->limitVal,
+                $this->offsetVal,
+            );
+        }
+
         if (!empty($this->orders)) {
             return $this->getWithOrdering();
         }
@@ -154,6 +176,14 @@ final class QueryBuilder
      */
     public function first(): array|null
     {
+        if ($this->native !== null) {
+            return $this->native->executeNativeFirst(
+                $this->collection,
+                $this->conditions,
+                $this->orders,
+            );
+        }
+
         foreach ($this->storage->stream($this->collection) as $doc) {
             if ($this->matchesAll($doc)) {
                 return $doc;
@@ -168,6 +198,13 @@ final class QueryBuilder
      */
     public function count(): int
     {
+        if ($this->native !== null) {
+            return $this->native->executeNativeCount(
+                $this->collection,
+                $this->conditions,
+            );
+        }
+
         $n = 0;
 
         foreach ($this->storage->stream($this->collection) as $doc) {
@@ -184,6 +221,13 @@ final class QueryBuilder
      */
     public function exists(): bool
     {
+        if ($this->native !== null) {
+            return $this->native->executeNativeExists(
+                $this->collection,
+                $this->conditions,
+            );
+        }
+
         foreach ($this->storage->stream($this->collection) as $doc) {
             if ($this->matchesAll($doc)) {
                 return true;
@@ -325,6 +369,26 @@ final class QueryBuilder
             throw new \InvalidArgumentException(
                 "Unknown query operator '{$op}'. Supported: " . implode(', ', $valid)
             );
+        }
+    }
+
+    /**
+     * Walk through any DecoratorInterface layers to find a NativeQueryInterface.
+     */
+    private function resolveNativeStorage(StorageInterface $storage): NativeQueryInterface|null
+    {
+        $current = $storage;
+
+        while (true) {
+            if ($current instanceof NativeQueryInterface) {
+                return $current;
+            }
+
+            if ($current instanceof DecoratorInterface) {
+                $current = $current->getInnerAdapter();
+            } else {
+                return null;
+            }
         }
     }
 }
