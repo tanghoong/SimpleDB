@@ -1,0 +1,22 @@
+{
+    "name": "tanghoong/simpledb",
+    "description": "A lightweight NoSQL JSON Document Storage library for PHP",
+    "type": "library",
+    "license": "MIT",
+    "require": {
+        "php": ">=8.1"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^11.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "SimpleDB\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "SimpleDB\\Tests\\": "tests/"
+        }
+    }
+}

@@ -1,132 +1,312 @@
-SimpleDB
-========
-SimpleDB is PHP class which creates a simple API for dealing with JSON document storage.
+# SimpleDB
 
-<h3>Folder Schema</h3>
+![PHP Version](https://img.shields.io/badge/php-%3E%3D8.1-8892BF)
+![License](https://img.shields.io/badge/license-MIT-green)
 
-<pre>
-PROJECT ROOT
-    models
-        Simple_DB.php
-    json
-        FOLDERS HERE
-            FILES HERE
-</pre>
-    
-If you create the folder structure above and autoload or include this class, everything will work out of the box. 
-If not, you will need to edit the constructor to tell the class where you want to store your files. The default 
-location is a json folder in the project root. In other words, the storage is located at the same folder level as 
-the folder which contains your classes.
+A lightweight, zero-dependency **NoSQL JSON Document Storage** library for PHP 8.1+.
 
-If you are interested in protecting your data from prying eyes, use an .htaccess file in the json folder:
+SimpleDB lets you use the local filesystem as a simple document store — one JSON file per document — without spinning up a database server. It is ideal for CLI tools, static-site generators, feature-flag stores, local development data, and any single-machine scenario where you need quick, structured persistence.
 
-<pre>
-Order deny,allow
-Deny from all
-</pre>
+---
 
-<h3>Basic Usage</h3>
+## Installation
 
-Instantiate the class with the name of the type of object you are storing. If you are storing cars, the code would look 
-like this:
+```bash
+composer require tanghoong/simpledb
+```
 
-<pre>
-$simpleDB = new Simple_DB('car');
-</pre>
+**Requirements:** PHP ≥ 8.1
 
-This will create a folder for cars. You can think of that folder as a "table."
+---
 
-The class contains four basic methods which attempt to mimic HTTP methods:
+## Quick Start
 
-<pre>
-Simple_DB::get($id);
-Simple_DB::post($content);
-Simple_DB::put($id, $content);
-Simple_DB::delete($id);
-</pre>
+```php
+use SimpleDB\Adapters\FileAdapter;
+use SimpleDB\SimpleDB;
 
-<h3>Method Reference</h3>
+// Point the adapter at a writable directory
+$adapter = new FileAdapter('/path/to/storage');
 
-<h4>get</h4>
-If you have existing cars that you want to retrieve, you can do so like this:
+// Open (or create) a collection called "cars"
+$db = new SimpleDB('cars', $adapter);
 
-<pre>
-$simpleDB->get();
-</pre>
+// Create a document — returns the auto-generated ID
+$id = $db->post(['make' => 'Honda', 'model' => 'Civic', 'color' => 'blue']);
 
-Calling <code>get</code> without the ID parameter will return an array of objects containing all of that type of object. 
-The code above will give you every car in storage. Calling <code>get</code> with an ID parameter returns a single object.
+// Retrieve it
+$car = $db->get($id);       // ['make' => 'Honda', 'model' => 'Civic', 'color' => 'blue']
 
-<h4>post</h4>
+// Update it
+$db->put($id, ['make' => 'Honda', 'model' => 'Civic', 'color' => 'red']);
 
-<pre>
-$simpleDB->post($content);
-</pre>
+// Delete it
+$db->delete($id);
+```
 
-This method creates a new "row" or JSON document in storage. It creates an ID for the document and posts your object 
-in plain text to that file. The file will be <code>YOURID.json</code>. You can pass post a string, array or object; 
-but your data will get converted to a JSON object in the end.
+---
 
-<h4>put</h4>
+## API Reference
 
-<pre>
-$simpleDB->put($id, $content);
-</pre>
+### `SimpleDB`
 
-Similar to the <code>post</code> method, this is usually used to update an existing item in storage. This is not 
-necessarily the case, however. You can use this method to write an item with a custom ID if you'd like.
+#### Constructor
 
-<h4>delete</h4>
-<pre>
-$simpleDB->delete($id);
-</pre>
+```php
+public function __construct(string $collection, StorageInterface $storage)
+```
 
-The name says it all, and the ID is mandatory.
+| Parameter     | Type               | Description                       |
+|---------------|--------------------|-----------------------------------|
+| `$collection` | `string`           | Name of the document collection   |
+| `$storage`    | `StorageInterface` | Storage adapter instance          |
 
-<h3>Advanced Usage</h3>
-The class also contains a few more public methods that you may find useful.
+---
 
-<h4>query</h4>
-<pre>
-$simpleDB->query($queryString);
-</pre>
+#### `get(string $id): array|null`
 
-This method is used to search for objects matching a certain criteria. The query string is formatted like a GET string. 
-To continue with our car example, you might search for a car like so:
+Retrieve a single document by ID. Returns `null` when the document does not exist.
 
-<pre>
-$query = $simpleDB->query('color=blue&manufacturer=Honda');
-</pre>
+```php
+$doc = $db->get('abc123');
+if ($doc === null) {
+    // document not found
+}
+```
 
-This will find all blue Hondas, returning an array of objects. Even though you may store complex multi-dimensional 
-objects with this class, the query function will only search the top level. Make sure to include variables that need to 
-be searched in the top level of your data schema to properly make use of this method.
+---
 
-<h4>returnSingleId</h4>
-<pre>
-$car = $simpleDB->query('model=Civic');
-$carId = $simpleDB->returnSingleId($car);
-</pre>
+#### `getAll(): array`
 
-This method will give easy access to the ID of the object you retreived using <code>get</code>. Use it in a loop for 
-multiple objects.
+Return all documents in the collection as an associative array keyed by document ID.
 
-<h4>timestamp</h4>
-<pre>
-$car = $simpleDB->query('model=Civic');
-$carId = $simpleDB->returnSingleId($car);
-$time = $simpleDB->timestamp($carId);
-</pre>
+```php
+$all = $db->getAll();
+// ['id1' => [...], 'id2' => [...]]
+```
 
-This is a simple method for retreiving the last modified date on the object. It makes use of PHP's 
-<code>filemtime()</code>.
+---
 
-<h4>getJSON</h4>
+#### `post(array $data): string`
 
-<pre>
-$car = $simpleDB->query('model=Civic');
-$carId = $simpleDB->returnSingleId($car);
-$json = $simpleDB->getJSON($carId);
-</pre>
+Create a new document with an auto-generated ID. Returns the new document ID.
 
-This function returns the literal JSON string without decoding it.
+```php
+$id = $db->post(['name' => 'Alice', 'age' => 30]);
+```
+
+---
+
+#### `put(string $id, array $data): void`
+
+Write (create or replace) a document with an explicit ID.
+
+```php
+$db->put('my-custom-id', ['name' => 'Bob']);
+```
+
+---
+
+#### `delete(string $id): void`
+
+Delete a document. Throws `DocumentNotFoundException` if the document does not exist.
+
+```php
+use SimpleDB\Exceptions\DocumentNotFoundException;
+
+try {
+    $db->delete($id);
+} catch (DocumentNotFoundException $e) {
+    // handle missing document
+}
+```
+
+---
+
+#### `query(array $criteria): array`
+
+Return all documents whose top-level fields match every key/value pair in `$criteria`.
+Returns an associative array keyed by document ID (empty array if no matches).
+
+```php
+// Find all blue Hondas
+$results = $db->query(['make' => 'Honda', 'color' => 'blue']);
+```
+
+---
+
+#### `timestamp(string $id): int|null`
+
+Return the Unix timestamp of the last modification time for a document, or `null` if it does not exist.
+
+```php
+$ts = $db->timestamp($id);
+echo date('Y-m-d H:i:s', $ts);
+```
+
+---
+
+#### `exists(string $id): bool`
+
+Check whether a document with the given ID is present in the collection.
+
+```php
+if ($db->exists($id)) {
+    // document is there
+}
+```
+
+---
+
+### `FileAdapter`
+
+#### Constructor
+
+```php
+public function __construct(string $storageDir)
+```
+
+Creates (if needed) and validates the storage root directory. Throws `StorageException` if the directory cannot be created or is invalid.
+
+```php
+$adapter = new FileAdapter('/var/data/myapp');
+```
+
+**ID / collection name rules:** only `[a-zA-Z0-9_-]` characters are permitted. Any other character (including path separators) causes a `StorageException` to be thrown immediately, preventing path-traversal attacks.
+
+---
+
+## Advanced Usage
+
+### Custom Storage Directory
+
+```php
+$adapter = new FileAdapter(sys_get_temp_dir() . '/myapp-data');
+$db      = new SimpleDB('sessions', $adapter);
+```
+
+### Error Handling
+
+All exceptions extend `SimpleDB\Exceptions\SimpleDBException`:
+
+| Exception                    | When thrown                                       |
+|------------------------------|---------------------------------------------------|
+| `StorageException`           | I/O failure or invalid ID / collection name       |
+| `DocumentNotFoundException`  | `delete()` called with an ID that does not exist  |
+
+```php
+use SimpleDB\Exceptions\SimpleDBException;
+use SimpleDB\Exceptions\DocumentNotFoundException;
+use SimpleDB\Exceptions\StorageException;
+
+try {
+    $db->delete('unknown-id');
+} catch (DocumentNotFoundException $e) {
+    echo "Not found: " . $e->getMessage();
+} catch (StorageException $e) {
+    echo "I/O error: " . $e->getMessage();
+} catch (SimpleDBException $e) {
+    echo "Library error: " . $e->getMessage();
+}
+```
+
+### Implementing a Custom Storage Adapter
+
+Any class implementing `SimpleDB\Contracts\StorageInterface` can be used as the storage backend:
+
+```php
+use SimpleDB\Contracts\StorageInterface;
+
+class RedisAdapter implements StorageInterface
+{
+    // implement read, readAll, write, delete, exists, listIds, timestamp
+}
+
+$db = new SimpleDB('sessions', new RedisAdapter($redis));
+```
+
+---
+
+## Safety Features
+
+| Feature                    | Details                                                       |
+|----------------------------|---------------------------------------------------------------|
+| **Atomic writes**          | Documents are written to a temp file then `rename()`-d into place, preventing partial-write corruption |
+| **File locking**           | `flock(LOCK_EX)` ensures exclusive access during writes       |
+| **ID sanitisation**        | Rejects any ID/collection name that contains characters outside `[a-zA-Z0-9_-]`, blocking path-traversal attacks |
+| **No error suppression**   | No `@` operator — all failures surface as typed exceptions    |
+| **Strict types**           | `declare(strict_types=1)` in every PHP file                   |
+
+---
+
+## Running Tests
+
+```bash
+composer install
+vendor/bin/phpunit
+```
+
+---
+
+## Project Structure
+
+```
+SimpleDB/
+├── src/
+│   ├── SimpleDB.php                     # Main class
+│   ├── Contracts/
+│   │   └── StorageInterface.php         # Storage adapter contract
+│   ├── Adapters/
+│   │   └── FileAdapter.php              # File-based storage adapter
+│   └── Exceptions/
+│       ├── SimpleDBException.php        # Base exception
+│       ├── DocumentNotFoundException.php
+│       └── StorageException.php
+├── tests/
+│   └── SimpleDBTest.php                 # PHPUnit test suite
+├── composer.json
+├── phpunit.xml
+└── README.md
+```
+
+---
+
+## Migrating from `Simple_DB` (v1)
+
+The original `Simple_DB.php` (2013) has been removed. Key migration points:
+
+| Old API                                  | New API                                    |
+|------------------------------------------|--------------------------------------------|
+| `new Simple_DB('cars')`                  | `new SimpleDB('cars', new FileAdapter($dir))` |
+| `$db->get($id)`                          | `$db->get($id)` (returns `null` not `false`) |
+| `$db->get()`                             | `$db->getAll()`                            |
+| `$db->post($array)`                      | `$db->post($array)`                        |
+| `$db->put($id, $array)`                  | `$db->put($id, $array)`                    |
+| `$db->delete($id)`                       | `$db->delete($id)` (throws on missing)     |
+| `$db->query('color=blue&make=Honda')`    | `$db->query(['color' => 'blue', 'make' => 'Honda'])` |
+| `$db->timestamp($id)`                    | `$db->timestamp($id)` (returns `null` not `false`) |
+| `$db->getJSON($id)` *(broken in v1)*     | `json_encode($db->get($id))`               |
+
+---
+
+## Requirements
+
+- PHP ≥ 8.1
+- A writable filesystem directory for storage
+
+---
+
+## License
+
+MIT © [Simplicity Solutions Group](http://simplicitysolutionsgroup.com)
+
+---
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/my-feature`)
+3. Write tests for your changes
+4. Ensure all tests pass (`vendor/bin/phpunit`)
+5. Open a pull request
+
