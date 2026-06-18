@@ -1,9 +1,9 @@
 # SimpleDB
 
-![PHP Version](https://img.shields.io/badge/php-%3E%3D8.1-8892BF)
+![PHP Version](https://img.shields.io/badge/php-%3E%3D8.2-8892BF)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-A lightweight, zero-dependency **NoSQL JSON Document Storage** library for PHP 8.1+.
+A lightweight, zero-dependency **NoSQL JSON Document Storage** library for PHP 8.2+.
 
 SimpleDB lets you use the local filesystem as a simple document store — one JSON file per document — without spinning up a database server. It is ideal for CLI tools, static-site generators, feature-flag stores, local development data, and any single-machine scenario where you need quick, structured persistence.
 
@@ -15,7 +15,7 @@ SimpleDB lets you use the local filesystem as a simple document store — one JS
 composer require tanghoong/simpledb
 ```
 
-**Requirements:** PHP ≥ 8.1
+**Requirements:** PHP ≥ 8.2
 
 ---
 
@@ -291,7 +291,7 @@ The original `Simple_DB.php` (2013) has been removed. Key migration points:
 
 ## Requirements
 
-- PHP ≥ 8.1
+- PHP ≥ 8.2
 - A writable filesystem directory for storage
 
 ---
