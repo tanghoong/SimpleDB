@@ -184,10 +184,24 @@ final class QueryBuilder
             );
         }
 
+        if (!empty($this->orders)) {
+            $results = $this->getWithOrdering();
+            return !empty($results) ? reset($results) : null;
+        }
+
+        $skipped = 0;
+
         foreach ($this->storage->stream($this->collection) as $doc) {
-            if ($this->matchesAll($doc)) {
-                return $doc;
+            if (!$this->matchesAll($doc)) {
+                continue;
             }
+
+            if ($skipped < $this->offsetVal) {
+                $skipped++;
+                continue;
+            }
+
+            return $doc;
         }
 
         return null;
@@ -331,7 +345,7 @@ final class QueryBuilder
             '>='          => $fieldExists && $actual >= $expected,
             '<'           => $fieldExists && $actual < $expected,
             '<='          => $fieldExists && $actual <= $expected,
-            'in'          => $fieldExists && in_array($actual, (array) $expected, strict: true),
+            'in'          => in_array($actual, (array) $expected, strict: true),
             'not_in'      => !in_array($actual, (array) $expected, strict: true),
             'contains'    => is_string($actual) && str_contains($actual, (string) $expected),
             'starts_with' => is_string($actual) && str_starts_with($actual, (string) $expected),

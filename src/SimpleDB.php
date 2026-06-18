@@ -255,8 +255,7 @@ class SimpleDB implements \ArrayAccess, \Countable, \IteratorAggregate
      */
     public function batchPost(array $documents): array
     {
-        $toWrite   = [];
-        $pipedData = [];
+        $toWrite = [];
 
         foreach ($documents as $data) {
             do {

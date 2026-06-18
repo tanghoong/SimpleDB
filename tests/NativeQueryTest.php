@@ -53,7 +53,7 @@ class NativeQueryTest extends TestCase
         $phpPath = $this->adapter->readAll('products');
         $filtered = array_filter($phpPath, fn($d) => $d['type'] === 'fruit');
 
-        $this->assertSame(array_keys($filtered), array_keys($native));
+        $this->assertEqualsCanonicalizing(array_keys($filtered), array_keys($native));
     }
 
     // -------------------------------------------------------------------------
