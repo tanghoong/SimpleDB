@@ -25,22 +25,19 @@ composer require tanghoong/simpledb
 use SimpleDB\Adapters\FileAdapter;
 use SimpleDB\SimpleDB;
 
-// Point the adapter at a writable directory
 $adapter = new FileAdapter('/path/to/storage');
+$db      = new SimpleDB('cars', $adapter);
 
-// Open (or create) a collection called "cars"
-$db = new SimpleDB('cars', $adapter);
-
-// Create a document — returns the auto-generated ID
+// Create — returns auto-generated ID
 $id = $db->post(['make' => 'Honda', 'model' => 'Civic', 'color' => 'blue']);
 
-// Retrieve it
-$car = $db->get($id);       // ['make' => 'Honda', 'model' => 'Civic', 'color' => 'blue']
+// Read
+$car = $db->get($id);
 
-// Update it
+// Update
 $db->put($id, ['make' => 'Honda', 'model' => 'Civic', 'color' => 'red']);
 
-// Delete it
+// Delete
 $db->delete($id);
 ```
 
@@ -48,351 +45,354 @@ $db->delete($id);
 
 ## API Reference
 
-### `SimpleDB`
-
-#### Constructor
+### `SimpleDB` constructor
 
 ```php
 public function __construct(
-    string $collection,
+    string           $collection,
     StorageInterface $storage,
-    callable|null $logger = null,
+    callable|null    $logger     = null,
+    bool             $timestamps = false,
 )
 ```
 
-| Parameter     | Type                | Description                                                                 |
-|---------------|---------------------|-----------------------------------------------------------------------------|
-| `$collection` | `string`            | Name of the document collection                                             |
-| `$storage`    | `StorageInterface`  | Storage adapter instance                                                    |
-| `$logger`     | `callable\|null`   | Optional log sink: `fn(string $level, string $message, array $context): void` |
+| Parameter      | Type                | Description                                                                   |
+|----------------|---------------------|-------------------------------------------------------------------------------|
+| `$collection`  | `string`            | Collection name (alphanumeric, `_`, `-` only)                                 |
+| `$storage`     | `StorageInterface`  | Storage adapter instance                                                      |
+| `$logger`      | `callable\|null`   | Optional log sink: `fn(string $level, string $message, array $context): void` |
+| `$timestamps`  | `bool`              | Auto-inject `_created_at` / `_updated_at` Unix timestamps                     |
 
-The optional `$logger` callable lets you hook into internal debug events (cache hits, writes, deletes) without any external dependency:
+---
+
+### Fluent Query Builder
+
+The most expressive way to query.  Start with `->where()` or `->newQuery()`, chain conditions, terminate with `->get()`, `->first()`, `->count()`, or `->exists()`.
 
 ```php
-$db = new SimpleDB('cars', $adapter, function (string $level, string $msg, array $ctx): void {
-    error_log("[{$level}] {$msg}");
+// Equality shorthand
+$results = $db->where('category', 'fruit')->get();
+
+// Comparison operator
+$results = $db->where('price', '<', 5.0)->get();
+
+// Chain conditions + order + paginate
+$page2 = $db->where('category', 'fruit')
+            ->where('stock', '>', 0)
+            ->orderBy('price', 'asc')
+            ->limit(10)
+            ->offset(10)
+            ->get();
+
+// Terminal: first matching document
+$doc = $db->where('name', 'starts_with', 'App')->first();
+
+// Terminal: count without loading documents
+$n = $db->where('category', 'veggie')->count();
+
+// Terminal: existence check
+if ($db->where('sku', 'ABC-001')->exists()) { ... }
+```
+
+#### Supported operators for `->where(field, operator, value)`
+
+| Operator       | Matches when…                                     |
+|----------------|---------------------------------------------------|
+| `=` (default)  | strict `===` equality                             |
+| `!=`           | strict `!==` inequality                           |
+| `>`            | field value is greater than                       |
+| `>=`           | field value is greater than or equal to           |
+| `<`            | field value is less than                          |
+| `<=`           | field value is less than or equal to              |
+| `in`           | field value appears in the given array            |
+| `not_in`       | field value does not appear in the given array    |
+| `contains`     | field string contains the substring               |
+| `starts_with`  | field string starts with the prefix               |
+| `ends_with`    | field string ends with the suffix                 |
+| `null`         | field is missing or set to `null`                 |
+| `not_null`     | field exists and is not `null`                    |
+
+#### Convenience constraint methods
+
+```php
+$db->newQuery()->whereIn('status', ['active', 'pending'])->get();
+$db->newQuery()->whereNotIn('type', ['archived'])->get();
+$db->newQuery()->whereNull('deleted_at')->get();
+$db->newQuery()->whereNotNull('email')->get();
+```
+
+#### Dot-notation for nested fields
+
+```php
+// Document: {'address': {'city': 'Paris', 'zip': '75001'}}
+$results = $db->where('address.city', 'Paris')->get();
+$results = $db->where('address.zip', 'starts_with', '75')->get();
+```
+
+---
+
+### PHP Native Interface Support
+
+`SimpleDB` implements `ArrayAccess`, `Countable`, and `IteratorAggregate`, letting you use it with native PHP syntax:
+
+```php
+// ArrayAccess
+$car          = $db['abc123'];    // → get($id)
+$db['abc123'] = $data;            // → put($id, $data)
+$db[]         = $data;            // → post($data)  (ID is auto-generated)
+unset($db['abc123']);             // → delete($id), silently ignores missing
+
+if (isset($db['abc123'])) { ... } // → exists($id)
+
+// Countable
+$total = count($db);
+
+// IteratorAggregate
+foreach ($db as $id => $document) {
+    // stream all documents lazily
+}
+```
+
+---
+
+### Auto-Timestamps
+
+Pass `timestamps: true` to automatically inject `_created_at` and `_updated_at` fields.
+
+```php
+$db = new SimpleDB('posts', $adapter, timestamps: true);
+
+$id  = $db->post(['title' => 'Hello World']);
+$doc = $db->get($id);
+// ['title' => 'Hello World', '_created_at' => 1700000000, '_updated_at' => 1700000000]
+
+$db->put($id, ['title' => 'Updated']);
+$doc = $db->get($id);
+// ['title' => 'Updated', '_updated_at' => 1700000001]
+// Note: _created_at is NOT added by put()
+```
+
+- `_created_at` is only set by `post()` (not `put()`).
+- `_updated_at` is set by both `post()` and `put()`.
+- Pre-existing values in the document are preserved (`??=` semantics).
+
+---
+
+### Lifecycle Hooks
+
+Register callbacks that fire around write and delete operations.  Hooks run in registration order.
+
+```php
+// Transform data before it is written (must return the array)
+$db->beforeWrite(function (string $id, array $data, bool $isNew): array {
+    $data['slug'] = strtolower(str_replace(' ', '-', $data['title'] ?? ''));
+    return $data;
+});
+
+// React after a successful write
+$db->afterWrite(function (string $id, array $data, bool $isNew): void {
+    $cache->invalidate($id);
+});
+
+// Validate / audit before deletion
+$db->beforeDelete(function (string $id): void {
+    auditLog("about to delete {$id}");
+});
+
+// React after deletion
+$db->afterDelete(function (string $id): void {
+    searchIndex->remove($id);
 });
 ```
 
+Hook execution order per operation:
+
+```
+post() / put()                      delete()
+──────────────────────────────      ────────────────────────
+1. inject timestamps (if enabled)   1. beforeDelete hooks
+2. beforeWrite hooks (→ data)       2. storage::delete()
+3. storage::write()                 3. cache invalidation
+4. cache update                     4. afterDelete hooks
+5. afterWrite hooks
+```
+
 ---
+
+### CRUD Methods
 
 #### `get(string $id): array|null`
 
-Retrieve a single document by ID. Returns `null` when the document does not exist.
-Serves from the in-process cache on subsequent calls within the same request.
-
 ```php
-$doc = $db->get('abc123');
-if ($doc === null) {
-    // document not found
-}
+$doc = $db->get('abc123');  // null when missing
 ```
-
----
 
 #### `getAll(): array`
 
-Return all documents in the collection as an associative array keyed by document ID.
-Populates the in-process cache for all returned documents.
-
 ```php
-$all = $db->getAll();
-// ['id1' => [...], 'id2' => [...]]
+$all = $db->getAll();  // ['id1' => [...], 'id2' => [...]]
 ```
-
----
 
 #### `stream(): Generator`
 
-Lazily yield documents one at a time without loading the entire collection into memory.
-Ideal for large collections.
+Lazily yield documents without loading the whole collection into memory:
 
 ```php
-foreach ($db->stream() as $id => $document) {
-    // process one document at a time
-}
+foreach ($db->stream() as $id => $document) { ... }
+// Equivalent to: foreach ($db as $id => $document) { ... }
 ```
-
----
 
 #### `count(): int`
 
-Return the total number of documents in the collection.
-
 ```php
-$total = $db->count(); // e.g. 42
+$n = $db->count();           // total documents
+$n = count($db);             // same, via Countable
+$n = $db->where('x', 1)->count();  // filtered count
 ```
-
----
 
 #### `post(array $data): string`
 
-Create a new document with an auto-generated ID. Returns the new document ID.
+Creates a document with an auto-generated ID.  Returns the ID.
 
 ```php
 $id = $db->post(['name' => 'Alice', 'age' => 30]);
 ```
 
----
-
 #### `batchPost(array $documents): string[]`
-
-Create multiple documents in a single call. Returns an array of the generated IDs
-in the same order as the input.
 
 ```php
 $ids = $db->batchPost([
     ['make' => 'Honda'],
     ['make' => 'Toyota'],
-    ['make' => 'Ford'],
 ]);
-// $ids = ['a1b2c3d4...', 'e5f6a7b8...', ...]
 ```
-
----
 
 #### `put(string $id, array $data): void`
 
-Write (create or replace) a document with an explicit ID.
-
 ```php
-$db->put('my-custom-id', ['name' => 'Bob']);
+$db->put('my-id', ['name' => 'Bob']);
 ```
-
----
 
 #### `batchPut(array $documents): void`
 
-Write (create or replace) multiple documents with explicit IDs in a single call.
-
 ```php
 $db->batchPut([
-    'car-1' => ['make' => 'Honda', 'color' => 'blue'],
-    'car-2' => ['make' => 'Toyota', 'color' => 'red'],
+    'id-1' => ['make' => 'Honda', 'color' => 'blue'],
+    'id-2' => ['make' => 'Toyota', 'color' => 'red'],
 ]);
 ```
 
----
-
 #### `delete(string $id): void`
 
-Delete a document. Throws `DocumentNotFoundException` if the document does not exist.
+Throws `DocumentNotFoundException` when the document does not exist.
 
 ```php
-use SimpleDB\Exceptions\DocumentNotFoundException;
-
 try {
     $db->delete($id);
-} catch (DocumentNotFoundException $e) {
-    // handle missing document
-}
+} catch (DocumentNotFoundException $e) { ... }
 ```
-
----
 
 #### `query(array $criteria, int $limit = 0, int $offset = 0): array`
 
-Return all documents whose top-level fields match every key/value pair in `$criteria`.
-Returns an associative array keyed by document ID (empty array if no matches).
-
-Supports pagination via `$limit` and `$offset`:
+Simple strict-equality filter (backward-compatible).  For richer queries use the fluent builder.
 
 ```php
-// Find all blue Hondas
 $results = $db->query(['make' => 'Honda', 'color' => 'blue']);
-
-// Paginate: second page of 10 results
-$page2 = $db->query([], limit: 10, offset: 10);
+$page    = $db->query([], limit: 20, offset: 40);
 ```
 
-| Parameter   | Type  | Default | Description                                      |
-|-------------|-------|---------|--------------------------------------------------|
-| `$criteria` | array | —       | Field/value pairs every matching document must satisfy |
-| `$limit`    | int   | `0`     | Maximum results to return (`0` = no limit)       |
-| `$offset`   | int   | `0`     | Number of matching results to skip               |
-
----
-
 #### `timestamp(string $id): int|null`
-
-Return the Unix timestamp of the last modification time for a document, or `null` if it does not exist.
 
 ```php
 $ts = $db->timestamp($id);
 echo date('Y-m-d H:i:s', $ts);
 ```
 
----
-
 #### `exists(string $id): bool`
 
-Check whether a document with the given ID is present in the collection.
-Checks the in-process cache before hitting storage.
-
-```php
-if ($db->exists($id)) {
-    // document is there
-}
-```
-
----
+Checks in-process cache first, then falls back to storage.
 
 #### `getCollection(): string`
 
-Return the name of the current collection.
-
----
-
 #### `clearCache(): void`
 
-Discard the in-process document cache. Useful when another process may have modified
-the collection externally.
-
 ```php
-$db->clearCache();
-$freshDoc = $db->get($id); // always reads from storage
+$db->clearCache();  // force next get() to re-read from disk
 ```
 
 ---
 
 ### `FileAdapter`
 
-#### Constructor
-
 ```php
 public function __construct(
     string $storageDir,
-    int $maxDocumentSize = 5 * 1024 * 1024,
+    int    $maxDocumentSize = 5 * 1024 * 1024,  // 5 MiB
 )
 ```
 
-| Parameter         | Type   | Default   | Description                                          |
-|-------------------|--------|-----------|------------------------------------------------------|
-| `$storageDir`     | string | —         | Writable root directory for all collections          |
-| `$maxDocumentSize`| int    | 5 MiB     | Maximum JSON byte size allowed per document          |
-
-Creates (if needed) and validates the storage root directory with permissions `0750`
-(owner read/write/execute, group read/execute, no world access).
-Throws `StorageException` if the directory cannot be created or is invalid.
-
 ```php
-// Default 5 MiB per document
 $adapter = new FileAdapter('/var/data/myapp');
 
 // Custom 256 KiB limit
 $adapter = new FileAdapter('/var/data/myapp', maxDocumentSize: 256 * 1024);
 ```
 
-**ID / collection name rules:** only `[a-zA-Z0-9_-]` characters are permitted.
-Any other character (including path separators) causes a `StorageException` immediately,
-preventing path-traversal attacks. All constructed paths are verified via `realpath()`
-to guard against symlink-based escapes.
+- Directories are created with mode `0750` (no world access).
+- All paths are verified with `realpath()` to guard against symlink escapes.
+- Documents exceeding `$maxDocumentSize` throw `StorageException`.
 
 ---
 
 ## Advanced Usage
 
-### Streaming Large Collections
-
-Use `stream()` to process a large collection without loading everything into memory:
-
-```php
-$adapter = new FileAdapter('/path/to/storage');
-$db      = new SimpleDB('events', $adapter);
-
-foreach ($db->stream() as $id => $event) {
-    processEvent($event);
-}
-```
-
-### Batch Operations
-
-```php
-// Create many documents efficiently
-$ids = $db->batchPost([
-    ['user' => 'alice', 'score' => 95],
-    ['user' => 'bob',   'score' => 87],
-    ['user' => 'carol', 'score' => 92],
-]);
-
-// Upsert many documents with known IDs
-$db->batchPut([
-    'config-email'   => ['enabled' => true,  'host' => 'smtp.example.com'],
-    'config-logging' => ['enabled' => false, 'level' => 'warning'],
-]);
-```
-
-### Pagination
-
-```php
-$pageSize = 20;
-$page     = (int) ($_GET['page'] ?? 1);
-
-$results = $db->query(
-    criteria: ['status' => 'active'],
-    limit:    $pageSize,
-    offset:   ($page - 1) * $pageSize,
-);
-```
-
 ### Debug Logging
 
 ```php
-use Monolog\Logger;
-use Monolog\Handler\StreamHandler;
-
-$log = new Logger('simpledb');
-$log->pushHandler(new StreamHandler('php://stderr'));
-
-$db = new SimpleDB('sessions', $adapter, function (string $level, string $msg, array $ctx) use ($log): void {
-    $log->$level($msg, $ctx);
+$db = new SimpleDB('cars', $adapter, logger: function (string $level, string $msg, array $ctx): void {
+    error_log("[simpledb:{$level}] {$msg}");
 });
 ```
 
-### Custom Storage Directory
+### Input Validation with Hooks
 
 ```php
-$adapter = new FileAdapter(sys_get_temp_dir() . '/myapp-data');
-$db      = new SimpleDB('sessions', $adapter);
+$db->beforeWrite(function (string $id, array $data, bool $isNew): array {
+    if (empty($data['email'])) {
+        throw new \InvalidArgumentException('email is required');
+    }
+    $data['email'] = strtolower($data['email']);
+    return $data;
+});
 ```
 
-### Error Handling
-
-All exceptions extend `SimpleDB\Exceptions\SimpleDBException`:
-
-| Exception                    | When thrown                                       |
-|------------------------------|---------------------------------------------------|
-| `StorageException`           | I/O failure, invalid ID / collection name, document too large, path escapes root |
-| `DocumentNotFoundException`  | `delete()` called with an ID that does not exist  |
+### Multi-stage Data Pipeline
 
 ```php
-use SimpleDB\Exceptions\SimpleDBException;
-use SimpleDB\Exceptions\DocumentNotFoundException;
-use SimpleDB\Exceptions\StorageException;
+$db->beforeWrite(fn($id, $data, $new) => array_merge($data, ['source' => 'api']));
+$db->beforeWrite(fn($id, $data, $new) => array_filter($data, fn($v) => $v !== ''));
+$db->afterWrite(fn($id, $data) => $searchIndex->index($id, $data));
+```
 
-try {
-    $db->delete('unknown-id');
-} catch (DocumentNotFoundException $e) {
-    echo "Not found: " . $e->getMessage();
-} catch (StorageException $e) {
-    echo "I/O error: " . $e->getMessage();
-} catch (SimpleDBException $e) {
-    echo "Library error: " . $e->getMessage();
+### Streaming Large Collections
+
+```php
+foreach ($db as $id => $document) {
+    processDocument($document);  // one document in memory at a time
 }
 ```
 
-### Implementing a Custom Storage Adapter
+### Custom Storage Adapter
 
-Any class implementing `SimpleDB\Contracts\StorageInterface` can be used as the storage backend.
-Note that `StorageInterface` now includes `stream()`, `batchWrite()`, and `count()`:
+Any class implementing `StorageInterface` can replace `FileAdapter`:
 
 ```php
 use SimpleDB\Contracts\StorageInterface;
 
 class RedisAdapter implements StorageInterface
 {
-    // implement: read, readAll, stream, write, batchWrite,
-    //            delete, exists, listIds, count, timestamp
+    // read, readAll, stream, write, batchWrite,
+    // delete, exists, listIds, count, timestamp
 }
 
 $db = new SimpleDB('sessions', new RedisAdapter($redis));
@@ -404,14 +404,14 @@ $db = new SimpleDB('sessions', new RedisAdapter($redis));
 
 | Feature                      | Details                                                                                          |
 |------------------------------|--------------------------------------------------------------------------------------------------|
-| **Atomic writes**            | Documents are written to a temp file then `rename()`-d into place, preventing partial-write corruption |
-| **File locking**             | `flock(LOCK_EX)` ensures exclusive access during writes                                          |
-| **ID sanitisation**          | Rejects any ID/collection name containing characters outside `[a-zA-Z0-9_-]`, blocking path-traversal |
-| **realpath() verification**  | All constructed paths are resolved and verified to stay inside the storage root, blocking symlink escapes |
-| **Restrictive permissions**  | Storage and collection directories are created with mode `0750` (no world access)               |
-| **Document size limit**      | Configurable maximum JSON byte size per document (default 5 MiB); oversized writes throw `StorageException` |
+| **Atomic writes**            | Temp file + `rename()` prevents partial-write corruption                                         |
+| **File locking**             | `flock(LOCK_EX)` serialises concurrent writers per document                                      |
+| **ID sanitisation**          | Only `[a-zA-Z0-9_-]` permitted — blocks path-traversal attempts                                 |
+| **realpath() verification**  | Constructed paths are resolved and verified to stay inside the storage root (blocks symlink escapes) |
+| **Restrictive permissions**  | Directories created with mode `0750` (no world access)                                           |
+| **Document size limit**      | Configurable max JSON size per document (default 5 MiB)                                          |
 | **No error suppression**     | No `@` operator — all failures surface as typed exceptions                                       |
-| **Strict types**             | `declare(strict_types=1)` in every PHP file                                                      |
+| **Strict types**             | `declare(strict_types=1)` in every file                                                          |
 
 ---
 
@@ -419,11 +419,23 @@ $db = new SimpleDB('sessions', new RedisAdapter($redis));
 
 | Feature                      | Details                                                                                          |
 |------------------------------|--------------------------------------------------------------------------------------------------|
-| **In-process cache**         | `get()` and `exists()` serve from a per-instance cache after the first read; invalidated on `put()` / `delete()` |
-| **Streaming reads**          | `stream()` yields documents one at a time via a PHP Generator, avoiding full collection load into memory |
-| **Batch operations**         | `batchPost()` and `batchPut()` reduce per-operation overhead for bulk inserts and updates        |
-| **Cheap counts**             | `count()` reads only file names — no document parsing required                                   |
-| **Pagination**               | `query($criteria, limit: N, offset: M)` avoids loading unnecessary results                      |
+| **In-process cache**         | `get()` / `exists()` serve from a per-instance cache after the first read; invalidated on write/delete |
+| **Streaming reads**          | `stream()` / `foreach ($db ...)` yield documents lazily via Generator                            |
+| **Batch operations**         | `batchPost()` / `batchPut()` reduce per-operation overhead                                       |
+| **Cheap counts**             | `count()` reads only filenames — no document parsing                                             |
+| **Lazy query filtering**     | QueryBuilder streams and evaluates conditions one document at a time; breaks early when possible  |
+| **Pagination**               | `query(limit:, offset:)` and `->limit()->offset()` on the builder                               |
+
+---
+
+## Error Handling
+
+| Exception                    | When thrown                                                      |
+|------------------------------|------------------------------------------------------------------|
+| `StorageException`           | I/O error, invalid ID/collection name, document too large, path escapes root |
+| `DocumentNotFoundException`  | `delete()` called with an ID that does not exist                 |
+
+Both extend `SimpleDB\Exceptions\SimpleDBException`.
 
 ---
 
@@ -431,7 +443,7 @@ $db = new SimpleDB('sessions', new RedisAdapter($redis));
 
 ```bash
 composer install
-vendor/bin/phpunit
+vendor/bin/phpunit          # 105 tests
 ```
 
 Static analysis:
@@ -452,12 +464,16 @@ SimpleDB/
 │   │   └── StorageInterface.php         # Storage adapter contract
 │   ├── Adapters/
 │   │   └── FileAdapter.php              # File-based storage adapter
+│   ├── Query/
+│   │   └── QueryBuilder.php             # Fluent query builder
 │   └── Exceptions/
 │       ├── SimpleDBException.php        # Base exception
 │       ├── DocumentNotFoundException.php
 │       └── StorageException.php
 ├── tests/
-│   └── SimpleDBTest.php                 # PHPUnit test suite (44 tests)
+│   ├── SimpleDBTest.php                 # Core CRUD / security / performance tests (44)
+│   ├── QueryBuilderTest.php             # Fluent query builder tests (33)
+│   └── SimpleDBFeaturesTest.php         # Interfaces / hooks / timestamps tests (28)
 ├── composer.json
 ├── phpunit.xml
 └── README.md
@@ -467,8 +483,6 @@ SimpleDB/
 
 ## Migrating from `Simple_DB` (v1)
 
-The original `Simple_DB.php` (2013) has been removed. Key migration points:
-
 | Old API                                  | New API                                    |
 |------------------------------------------|--------------------------------------------|
 | `new Simple_DB('cars')`                  | `new SimpleDB('cars', new FileAdapter($dir))` |
@@ -477,22 +491,16 @@ The original `Simple_DB.php` (2013) has been removed. Key migration points:
 | `$db->post($array)`                      | `$db->post($array)`                        |
 | `$db->put($id, $array)`                  | `$db->put($id, $array)`                    |
 | `$db->delete($id)`                       | `$db->delete($id)` (throws on missing)     |
-| `$db->query('color=blue&make=Honda')`    | `$db->query(['color' => 'blue', 'make' => 'Honda'])` |
+| `$db->query('color=blue&make=Honda')`    | `$db->where('color','blue')->where('make','Honda')->get()` |
 | `$db->timestamp($id)`                    | `$db->timestamp($id)` (returns `null` not `false`) |
-| `$db->getJSON($id)` *(broken in v1)*     | `json_encode($db->get($id))`               |
 
 ### Migrating Custom Storage Adapters (v2 → v3)
 
-`StorageInterface` gained three new methods. Add these to any custom adapter:
+`StorageInterface` gained three new methods — add these to any custom adapter:
 
 ```php
-// Lazy document streaming
 public function stream(string $collection): \Generator { ... }
-
-// Bulk write
 public function batchWrite(string $collection, array $documents): void { ... }
-
-// Cheap document count
 public function count(string $collection): int { ... }
 ```
 
