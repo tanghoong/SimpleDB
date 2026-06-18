@@ -5,7 +5,13 @@
 
 A lightweight, zero-dependency **NoSQL JSON Document Storage** library for PHP 8.2+.
 
-SimpleDB lets you use the local filesystem as a simple document store — one JSON file per document — without spinning up a database server. It is ideal for CLI tools, static-site generators, feature-flag stores, local development data, and any single-machine scenario where you need quick, structured persistence.
+SimpleDB stores documents as JSON on the local filesystem. Three interchangeable storage adapters let you choose the right I/O trade-off for your workload — and you can swap them without changing a single line of application code.
+
+| Adapter | Best for | I/O model |
+|---|---|---|
+| `FileAdapter` | Small collections, simple deployments | One JSON file per document |
+| `SqliteAdapter` | Larger collections, concurrent readers | Single SQLite file, WAL mode |
+| `ApcuCacheAdapter` | High read throughput (wraps any adapter) | APCu shared-memory L1 cache |
 
 ---
 
@@ -40,6 +46,104 @@ $db->put($id, ['make' => 'Honda', 'model' => 'Civic', 'color' => 'red']);
 // Delete
 $db->delete($id);
 ```
+
+---
+
+## Choosing a Storage Adapter
+
+### `FileAdapter` — default, zero extra dependencies
+
+One JSON file per document.  Simple, portable, works everywhere.
+
+```php
+$adapter = new FileAdapter('/path/to/storage');
+```
+
+**Bottleneck:** each `get()` opens, reads, and closes a separate file; `getAll()` / `query()` do this N times.  Fine for tens of thousands of small documents; gets slower above that.
+
+---
+
+### `SqliteAdapter` — overcomes I/O limits, no extra dependencies
+
+Stores every collection in a single SQLite database file using PHP's built-in `pdo_sqlite`.  Key benefits over `FileAdapter`:
+
+- **WAL journal mode** — multiple readers run concurrently without blocking each other or the writer.
+- **One I/O round-trip** for full collection reads (`SELECT … WHERE collection = ?`).
+- **`batchWrite()` uses a single transaction** — one `fsync` for N documents instead of N.
+- **`count()` is a cheap `SELECT COUNT(*)`** — no document parsing.
+- **64 MB in-memory page cache** keeps hot pages in RAM.
+- **5-second busy timeout** instead of immediate `SQLITE_BUSY` failure under contention.
+
+```php
+use SimpleDB\Adapters\SqliteAdapter;
+
+// File-backed (persists across requests)
+$adapter = new SqliteAdapter('/var/data/myapp.sqlite');
+
+// In-memory (testing / ephemeral data — lost when the process ends)
+$adapter = new SqliteAdapter(':memory:');
+
+// Custom document size limit
+$adapter = new SqliteAdapter('/var/data/myapp.sqlite', maxDocumentSize: 1 * 1024 * 1024);
+
+$db = new SimpleDB('cars', $adapter);
+```
+
+Multiple collections share the same SQLite file:
+
+```php
+$cars   = new SimpleDB('cars',   $adapter);
+$trucks = new SimpleDB('trucks', $adapter);
+```
+
+**Requirement:** `ext-pdo_sqlite` (ships with PHP; verify with `php -m | grep pdo_sqlite`).
+
+---
+
+### `ApcuCacheAdapter` — shared-memory L1 cache (wraps any adapter)
+
+A transparent decorator that keeps individual document reads in APCu — PHP's shared memory store, accessible to every worker in a PHP-FPM pool simultaneously.  A cache hit is a single in-process memory lookup with zero filesystem I/O.
+
+```php
+use SimpleDB\Adapters\ApcuCacheAdapter;
+use SimpleDB\Adapters\FileAdapter;
+use SimpleDB\Adapters\SqliteAdapter;
+
+// Wrap FileAdapter
+$db = new SimpleDB('cars', new ApcuCacheAdapter(new FileAdapter('/path/to/storage'), ttl: 60));
+
+// Wrap SqliteAdapter for maximum throughput
+$db = new SimpleDB('sessions', new ApcuCacheAdapter(new SqliteAdapter('/path/to/store.sqlite'), ttl: 30));
+```
+
+| Parameter    | Default          | Description                                           |
+|--------------|------------------|-------------------------------------------------------|
+| `$inner`     | —                | Any `StorageInterface` adapter to wrap                |
+| `$ttl`       | `0` (no expiry)  | APCu entry TTL in seconds                             |
+| `$keyPrefix` | `'simpledb:'`    | Namespace prefix for APCu keys                        |
+
+**How cache invalidation works:**
+
+| Operation | Cache behaviour |
+|-----------|----------------|
+| `read()`  | APCu hit → return immediately; miss → read inner, store in APCu |
+| `write()` | Write to inner, then update APCu entry |
+| `delete()` | Delete from inner, then evict APCu entry |
+| `readAll()` | `listIds()` from inner (one syscall), then serve each doc via APCu |
+| `stream()` | Delegate to inner, warm APCu as each doc passes through |
+| `count()` | Delegate to inner (accurate count required) |
+
+Missing documents are stored as a tombstone to prevent repeated storage lookups for non-existent keys.
+
+```php
+// Manual eviction
+$cached->evict('cars', $id);
+
+// Flush all APCu keys (affects the whole PHP process, use carefully)
+$cached->flushAll();
+```
+
+**Requirements:** `ext-apcu` (`pecl install apcu`); for CLI set `apc.enable_cli=1` in `php.ini`.
 
 ---
 
@@ -463,7 +567,9 @@ SimpleDB/
 │   ├── Contracts/
 │   │   └── StorageInterface.php         # Storage adapter contract
 │   ├── Adapters/
-│   │   └── FileAdapter.php              # File-based storage adapter
+│   │   ├── FileAdapter.php              # One JSON file per document
+│   │   ├── SqliteAdapter.php            # SQLite-backed (WAL, transactions)
+│   │   └── ApcuCacheAdapter.php         # APCu shared-memory cache decorator
 │   ├── Query/
 │   │   └── QueryBuilder.php             # Fluent query builder
 │   └── Exceptions/
@@ -471,9 +577,11 @@ SimpleDB/
 │       ├── DocumentNotFoundException.php
 │       └── StorageException.php
 ├── tests/
-│   ├── SimpleDBTest.php                 # Core CRUD / security / performance tests (44)
-│   ├── QueryBuilderTest.php             # Fluent query builder tests (33)
-│   └── SimpleDBFeaturesTest.php         # Interfaces / hooks / timestamps tests (28)
+│   ├── SimpleDBTest.php                 # Core CRUD / security / performance (44)
+│   ├── QueryBuilderTest.php             # Fluent query builder (33)
+│   ├── SimpleDBFeaturesTest.php         # Interfaces / hooks / timestamps (28)
+│   ├── SqliteAdapterTest.php            # SqliteAdapter full coverage (23)
+│   └── ApcuCacheAdapterTest.php         # ApcuCacheAdapter (skipped if APCu absent)
 ├── composer.json
 ├── phpunit.xml
 └── README.md
