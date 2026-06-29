@@ -479,8 +479,9 @@ class SqliteAdapter implements StorageInterface, NativeQueryInterface
         }
 
         if (is_float($value)) {
-            // No PDO::PARAM_FLOAT — bind as string and cast in SQL so SQLite sees REAL.
-            return ['CAST(? AS REAL)', [(string) $value, \PDO::PARAM_STR]];
+            // json_encode serialises floats locale-independently (always '.' decimal point).
+            // (string) $value would use LC_NUMERIC and break on e.g. de_DE locales.
+            return ['CAST(? AS REAL)', [json_encode($value), \PDO::PARAM_STR]];
         }
 
         return ['?', [(string) $value, \PDO::PARAM_STR]];
@@ -558,21 +559,21 @@ class SqliteAdapter implements StorageInterface, NativeQueryInterface
             case 'contains':
                 $pattern = '%' . $this->escapeLike((string) $expected) . '%';
                 return [
-                    "(typeof({$ex}) = 'text' AND {$ex} LIKE ? ESCAPE '!')",
+                    "(json_type(data, ?) = 'text' AND {$ex} LIKE ? ESCAPE '!')",
                     [$pathParam, $pathParam, [$pattern, \PDO::PARAM_STR]],
                 ];
 
             case 'starts_with':
                 $pattern = $this->escapeLike((string) $expected) . '%';
                 return [
-                    "(typeof({$ex}) = 'text' AND {$ex} LIKE ? ESCAPE '!')",
+                    "(json_type(data, ?) = 'text' AND {$ex} LIKE ? ESCAPE '!')",
                     [$pathParam, $pathParam, [$pattern, \PDO::PARAM_STR]],
                 ];
 
             case 'ends_with':
                 $pattern = '%' . $this->escapeLike((string) $expected);
                 return [
-                    "(typeof({$ex}) = 'text' AND {$ex} LIKE ? ESCAPE '!')",
+                    "(json_type(data, ?) = 'text' AND {$ex} LIKE ? ESCAPE '!')",
                     [$pathParam, $pathParam, [$pattern, \PDO::PARAM_STR]],
                 ];
 
@@ -685,7 +686,11 @@ class SqliteAdapter implements StorageInterface, NativeQueryInterface
         $params  = [];
 
         foreach ($orders as ['field' => $field, 'direction' => $dir]) {
-            $clauses[] = 'json_extract(data, ?) ' . strtoupper($dir);
+            $normalized = strtoupper($dir);
+            if ($normalized !== 'ASC' && $normalized !== 'DESC') {
+                throw new StorageException("Invalid sort direction '{$dir}'; must be 'asc' or 'desc'.");
+            }
+            $clauses[] = 'json_extract(data, ?) ' . $normalized;
             $params[]  = [$this->toJsonPath($field), \PDO::PARAM_STR];
         }
 

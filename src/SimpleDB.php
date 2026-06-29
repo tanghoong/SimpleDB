@@ -258,10 +258,7 @@ class SimpleDB implements \ArrayAccess, \Countable, \IteratorAggregate
         $toWrite = [];
 
         foreach ($documents as $data) {
-            do {
-                $id = bin2hex(random_bytes(8));
-            } while ($this->storage->exists($this->collection, $id) || isset($toWrite[$id]));
-
+            $id           = $this->generateId($toWrite);
             $processed    = $this->runWritePipeline($id, $data, isNew: true);
             $toWrite[$id] = $processed;
         }
@@ -364,32 +361,21 @@ class SimpleDB implements \ArrayAccess, \Countable, \IteratorAggregate
      */
     public function query(array $criteria, int $limit = 0, int $offset = 0): array
     {
-        $all     = $this->storage->readAll($this->collection);
-        $output  = [];
-        $skipped = 0;
-        $found   = 0;
+        $qb = $this->newQuery();
 
-        foreach ($all as $id => $document) {
-            $this->cache[$id] = $document;
-
-            if (!$this->matchesCriteria($document, $criteria)) {
-                continue;
-            }
-
-            if ($skipped < $offset) {
-                $skipped++;
-                continue;
-            }
-
-            $output[$id] = $document;
-            $found++;
-
-            if ($limit > 0 && $found >= $limit) {
-                break;
-            }
+        foreach ($criteria as $field => $value) {
+            $qb->where((string) $field, $value);
         }
 
-        return $output;
+        if ($offset > 0) {
+            $qb->offset($offset);
+        }
+
+        if ($limit > 0) {
+            $qb->limit($limit);
+        }
+
+        return $qb->get();
     }
 
     /**
@@ -443,8 +429,10 @@ class SimpleDB implements \ArrayAccess, \Countable, \IteratorAggregate
             $now = time();
             if ($isNew) {
                 $data['_created_at'] ??= $now;
+                $data['_updated_at'] ??= $now;   // preserve caller-supplied value on create
+            } else {
+                $data['_updated_at'] = $now;      // always refresh on update
             }
-            $data['_updated_at'] ??= $now;
         }
 
         foreach ($this->beforeWriteHooks as $hook) {
@@ -460,31 +448,13 @@ class SimpleDB implements \ArrayAccess, \Countable, \IteratorAggregate
         return $data;
     }
 
-    private function generateId(): string
+    private function generateId(array $exclude = []): string
     {
         do {
             $id = bin2hex(random_bytes(8));
-        } while ($this->storage->exists($this->collection, $id));
+        } while ($this->storage->exists($this->collection, $id) || isset($exclude[$id]));
 
         return $id;
-    }
-
-    /**
-     * Test whether a document's top-level keys satisfy every criterion (strict equality).
-     */
-    private function matchesCriteria(array $document, array $criteria): bool
-    {
-        foreach ($criteria as $key => $value) {
-            if (!array_key_exists($key, $document)) {
-                return false;
-            }
-
-            if ($document[$key] !== $value) {
-                return false;
-            }
-        }
-
-        return true;
     }
 
     private function log(string $level, string $message, array $context = []): void

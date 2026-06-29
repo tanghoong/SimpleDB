@@ -4,6 +4,14 @@ declare(strict_types=1);
 
 namespace SimpleDB\Contracts;
 
+/**
+ * Contract for all SimpleDB storage backends.
+ *
+ * BREAKING CHANGE (v2): Three methods were added to this interface that did not
+ * exist in v1 — stream(), batchWrite(), and count(). Any class that implemented
+ * the old interface must add these three methods or PHP will raise a fatal error
+ * at instantiation. See the bundled adapters for reference implementations.
+ */
 interface StorageInterface
 {
     public function read(string $collection, string $id): array|null;

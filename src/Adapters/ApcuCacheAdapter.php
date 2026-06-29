@@ -169,14 +169,9 @@ class ApcuCacheAdapter implements StorageInterface, DecoratorInterface
             return $value !== self::TOMBSTONE;
         }
 
-        $exists = $this->inner->exists($collection, $id);
-
-        // Warm the cache: store a tombstone for missing docs.
-        if (!$exists) {
-            apcu_store($key, self::TOMBSTONE, $this->ttl);
-        }
-
-        return $exists;
+        // Delegate to read() so APCu is warmed for both hits (document stored)
+        // and misses (tombstone stored), saving a second round-trip on read().
+        return $this->read($collection, $id) !== null;
     }
 
     public function listIds(string $collection): array
